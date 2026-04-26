@@ -80,7 +80,8 @@ injection."
 (cl-defstruct claude-dashboard-instance
   buffer cwd started-at last-output
   session-id model
-  branch-cache worktree-cache main-worktree-cache last-prompt-cache)
+  branch-cache worktree-cache main-worktree-cache last-prompt-cache
+  project-name-cache)
 
 (defvar claude-dashboard--instances (make-hash-table :test 'eq)
   "Map from eat buffer to `claude-dashboard-instance' struct.")
@@ -109,23 +110,76 @@ injection."
   (when (buffer-live-p (claude-dashboard-instance-buffer inst))
     (get-buffer-process (claude-dashboard-instance-buffer inst))))
 
+(defcustom claude-dashboard-awaiting-regexp
+  "❯ +\\(?:[0-9]+\\.\\|Yes\\b\\|No\\b\\)"
+  "Regexp matched against the tail of the eat buffer.
+Designed to match the cursor on a Claude Code menu of options
+\(numbered options like \"❯ 1.\" or a Yes/No prompt arrow).  A match
+means the user has options to choose from, not just that Claude is
+quiet."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-awaiting-tail-chars 300
+  "Number of trailing eat-buffer chars to scan for a pending menu.
+A real Claude Code menu cursor + remaining option lines fits in a
+few hundred chars, so once Claude streams any new output after the
+menu the cursor falls out of this window and the row stops showing
+the awaiting glyph."
+  :type 'integer :group 'claude-dashboard)
+
+(defun claude-dashboard--awaiting-input-p (inst)
+  "Return non-nil when INST is presenting a menu of options to the user.
+Looks only at the last `claude-dashboard-awaiting-tail-chars' of the
+eat buffer.  Requires the menu-cursor regexp AND a sibling option
+\(another numbered line or Yes/No token) appearing strictly after the
+cursor, anchoring the match to the visible bottom of the terminal."
+  (when-let* ((buf (claude-dashboard-instance-buffer inst))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (point-max))
+        (let ((tail-start (max (point-min)
+                               (- (point-max)
+                                  claude-dashboard-awaiting-tail-chars))))
+          (when (re-search-backward claude-dashboard-awaiting-regexp
+                                    tail-start t)
+            (let ((cursor-end (match-end 0)))
+              (save-excursion
+                (goto-char cursor-end)
+                (re-search-forward "^\\s-*[0-9]+\\.\\|\\bNo\\b\\|\\bYes\\b"
+                                   (point-max) t)))))))))
+
 (defun claude-dashboard--status (inst)
   "Return a symbol summarizing INST's current state.
-One of `running', `idle', or `exited'."
+One of `running' (Claude is actively producing output),
+`awaiting' (Claude is showing a menu of options for the user to pick),
+`idle' (process alive but quiet for a while, no pending menu),
+or `exited' (process is gone)."
   (let ((proc (claude-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
+     ((claude-dashboard--awaiting-input-p inst) 'awaiting)
      ((let ((last (claude-dashboard-instance-last-output inst)))
         (and last (> (- (float-time) last)
                      claude-dashboard-idle-threshold)))
       'idle)
      (t 'running))))
 
-(defun claude-dashboard--status-glyph (status)
+(defun claude-dashboard--state-color (status)
   (pcase status
-    ('running (propertize "●" 'face 'success))
-    ('idle    (propertize "◐" 'face 'warning))
-    ('exited  (propertize "○" 'face 'shadow))))
+    ('running  "#22cc22")
+    ('awaiting "#f5a623")
+    ('idle     "#3b9bff")
+    ('exited   "#ff4d4d")
+    (_         "gray60")))
+
+(defun claude-dashboard--status-glyph (status)
+  (let ((face `(:foreground ,(claude-dashboard--state-color status) :weight bold)))
+    (pcase status
+      ('running  (propertize "●" 'face face))
+      ('awaiting (propertize "?" 'face face))
+      ('idle     (propertize "◐" 'face face))
+      ('exited   (propertize "○" 'face face)))))
 
 (defun claude-dashboard--humanize-duration (secs)
   "Format SECS as a short human-readable string (e.g. 12s, 3m, 2h)."
@@ -135,11 +189,32 @@ One of `running', `idle', or `exited'."
           ((< s 86400) (format "%dh" (/ s 3600)))
           (t           (format "%dd" (/ s 86400))))))
 
+(defun claude-dashboard--git-project-name (cwd)
+  "Return the VCS-derived project name for CWD, or nil if not a git repo.
+Prefers the basename of `remote.origin.url' (with any `.git' stripped),
+falling back to the basename of the repo's main worktree."
+  (when (file-directory-p cwd)
+    (with-temp-buffer
+      (let ((default-directory cwd))
+        (cond
+         ((zerop (process-file "git" nil t nil
+                               "config" "--get" "remote.origin.url"))
+          (let ((url (string-trim (buffer-string))))
+            (when (string-match "\\([^/:]+?\\)\\(?:\\.git\\)?\\'" url)
+              (match-string 1 url))))
+         ((progn
+            (erase-buffer)
+            (zerop (process-file "git" nil t nil
+                                 "worktree" "list" "--porcelain")))
+          (goto-char (point-min))
+          (when (re-search-forward "^worktree \\(.+\\)$" nil t)
+            (file-name-nondirectory
+             (directory-file-name (match-string 1))))))))))
+
 (defun claude-dashboard--project-name (cwd)
-  "Best-effort project name for CWD."
-  (let ((p (project-current nil cwd)))
-    (if p (project-name p)
-      (file-name-nondirectory (directory-file-name cwd)))))
+  "Best-effort project name for CWD: VCS first, folder name as fallback."
+  (or (claude-dashboard--git-project-name cwd)
+      (file-name-nondirectory (directory-file-name cwd))))
 
 ;;; Branch + last-prompt caching
 
@@ -187,7 +262,8 @@ For the main checkout return \"main\".  For non-git directories return nil."
                 (:branch (claude-dashboard-instance-branch-cache inst))
                 (:worktree (claude-dashboard-instance-worktree-cache inst))
                 (:main-worktree (claude-dashboard-instance-main-worktree-cache inst))
-                (:prompt (claude-dashboard-instance-last-prompt-cache inst))))
+                (:prompt (claude-dashboard-instance-last-prompt-cache inst))
+                (:project-name (claude-dashboard-instance-project-name-cache inst))))
          (now (float-time)))
     (if (and cur (< (- now (cdr cur)) claude-dashboard-cache-ttl))
         (car cur)
@@ -197,7 +273,8 @@ For the main checkout return \"main\".  For non-git directories return nil."
           (:branch (setf (claude-dashboard-instance-branch-cache inst) entry))
           (:worktree (setf (claude-dashboard-instance-worktree-cache inst) entry))
           (:main-worktree (setf (claude-dashboard-instance-main-worktree-cache inst) entry))
-          (:prompt (setf (claude-dashboard-instance-last-prompt-cache inst) entry)))
+          (:prompt (setf (claude-dashboard-instance-last-prompt-cache inst) entry))
+          (:project-name (setf (claude-dashboard-instance-project-name-cache inst) entry)))
         value))))
 
 (defun claude-dashboard--last-prompt-for (cwd)
@@ -783,92 +860,153 @@ With prefix arg or when called from a row, restrict to that row's cwd."
 (defclass claude-dashboard-group-section (magit-section) ())
 (defclass claude-dashboard-instance-section (magit-section) ())
 
-(defconst claude-dashboard--row-format
-  " %s %s %-20s %-7s %5s %5s  %-14s %-14s %-20s %-8s %5s  %s"
-  "Format string used for both the column header and each instance row.
-Columns: mark, glyph, project, state, uptime, idle, branch, worktree,
-model, session, status-age, last-prompt.")
+(defcustom claude-dashboard-branch-max-width 20
+  "Hard cap on the BRANCH column width."
+  :type 'integer :group 'claude-dashboard)
 
-(defun claude-dashboard--header-line ()
+(defcustom claude-dashboard-worktree-max-width 16
+  "Hard cap on the WORKTREE column width."
+  :type 'integer :group 'claude-dashboard)
+
+(defun claude-dashboard--row-format (branch-w worktree-w)
+  "Return the row format string with dynamic BRANCH-W / WORKTREE-W widths."
+  (format " %%s %%s %%-20s %%-3s %%5s %%-%ds %%-%ds %%-8s %%5s  %%s"
+          branch-w worktree-w))
+
+(defun claude-dashboard--state-abbrev (status)
+  (pcase status
+    ('running  "RUN")
+    ('awaiting "ASK")
+    ('idle     "IDL")
+    ('exited   "EXT")
+    (_         "?")))
+
+(defun claude-dashboard--instance-branch (inst)
+  (or (claude-dashboard--cached
+       :branch inst
+       (lambda ()
+         (claude-dashboard--git-branch
+          (claude-dashboard-instance-cwd inst))))
+      "—"))
+
+(defun claude-dashboard--instance-worktree (inst)
+  (or (claude-dashboard--cached
+       :worktree inst
+       (lambda ()
+         (claude-dashboard--worktree-name
+          (claude-dashboard-instance-cwd inst))))
+      "—"))
+
+(defun claude-dashboard--column-width (header values cap)
+  "Width fitting HEADER plus the longest of VALUES, capped at CAP."
+  (min cap
+       (max (length header)
+            (apply #'max 0 (mapcar #'length values)))))
+
+(defun claude-dashboard--shorten-path (path max-width)
+  "Abbreviate PATH to fit within MAX-WIDTH columns.
+Keeps the leading `~' (when applicable) and the last directory
+segment intact, elides intermediate components with `…/'."
+  (let ((p (abbreviate-file-name (directory-file-name path))))
+    (if (<= (string-width p) max-width)
+        p
+      (let* ((parts (split-string p "/" t))
+             (has-tilde (string-prefix-p "~" p))
+             (head (if has-tilde (pop parts) ""))
+             (n (length parts))
+             (best (concat (if has-tilde (concat head "/") "")
+                           "…/"
+                           (or (car (last parts)) ""))))
+        (cl-loop for k from 2 to n
+                 for kept = (last parts k)
+                 for rendered = (concat (if has-tilde (concat head "/") "")
+                                        "…/"
+                                        (mapconcat #'identity kept "/"))
+                 while (<= (string-width rendered) max-width)
+                 do (setq best rendered))
+        (if (<= (string-width best) max-width)
+            best
+          (truncate-string-to-width best max-width nil ?\s "…"))))))
+
+(defvar claude-dashboard--group-color-palette
+  '("#e06c75" "#98c379" "#e5c07b" "#61afef" "#c678dd"
+    "#56b6c2" "#d19a66" "#b48ead" "#88c0d0" "#a3be8c")
+  "Palette of explicit hex colors used to tag each group root.")
+
+(defvar claude-dashboard--group-color-cache (make-hash-table :test 'equal)
+  "Map from group-root path to its assigned color.")
+
+(defun claude-dashboard--group-color (root)
+  "Return a stable color string for ROOT, assigning one on first sight."
+  (or (gethash root claude-dashboard--group-color-cache)
+      (let* ((n (hash-table-count claude-dashboard--group-color-cache))
+             (color (nth (mod n (length claude-dashboard--group-color-palette))
+                         claude-dashboard--group-color-palette)))
+        (puthash root color claude-dashboard--group-color-cache)
+        color)))
+
+(defun claude-dashboard--root-name (root)
+  "Final directory component of ROOT, used as the group's display name."
+  (file-name-nondirectory (directory-file-name root)))
+
+(defun claude-dashboard--state-face (status)
+  `(:foreground ,(claude-dashboard--state-color status) :weight bold))
+
+(defun claude-dashboard--header-line (branch-w worktree-w)
   "Return the column header line, faced as a section heading."
   (propertize
-   (format claude-dashboard--row-format
-           " " " " "PROJECT" "STATE" "UP" "IDLE" "BRANCH" "WORKTREE" "MODEL"
-           "SESSION" "STATUS" "LAST PROMPT")
+   (format (claude-dashboard--row-format branch-w worktree-w)
+           " " " " "PROJECT" "ST" "UP" "BRANCH" "WORKTREE"
+           "SESSION" "STATUS" "PATH")
    'face 'magit-section-heading))
 
-(defun claude-dashboard--format-instance-line (inst)
+(defun claude-dashboard--format-instance-line (inst branch-w worktree-w path-w)
   "Return a formatted single-line summary for INST."
   (let* ((status (claude-dashboard--status inst))
          (glyph (claude-dashboard--status-glyph status))
-         (proj (claude-dashboard--project-name
-                (claude-dashboard-instance-cwd inst)))
+         (cwd (claude-dashboard-instance-cwd inst))
+         (proj (claude-dashboard--cached
+                :project-name inst
+                (lambda ()
+                  (claude-dashboard--project-name cwd))))
+         (root (claude-dashboard--cached
+                :main-worktree inst
+                (lambda ()
+                  (claude-dashboard--main-worktree
+                   (claude-dashboard-instance-cwd inst)))))
+         (root-color (claude-dashboard--group-color root))
          (uptime (claude-dashboard--humanize-duration
                   (- (float-time)
                      (claude-dashboard-instance-started-at inst))))
-         (last-out (claude-dashboard-instance-last-output inst))
-         (idle (and last-out
-                    (claude-dashboard--humanize-duration
-                     (- (float-time) last-out))))
-         (branch (or (claude-dashboard--cached
-                      :branch inst
-                      (lambda ()
-                        (claude-dashboard--git-branch
-                         (claude-dashboard-instance-cwd inst))))
-                     "—"))
-         (worktree (or (claude-dashboard--cached
-                        :worktree inst
-                        (lambda ()
-                          (claude-dashboard--worktree-name
-                           (claude-dashboard-instance-cwd inst))))
-                       "—"))
-         (model (or (claude-dashboard-instance-model inst) "—"))
+         (branch (claude-dashboard--instance-branch inst))
+         (worktree (claude-dashboard--instance-worktree inst))
          (sid (or (and (claude-dashboard-instance-session-id inst)
                        (substring
                         (claude-dashboard-instance-session-id inst) 0 8))
-                  "—"))
-         (prompt (or (claude-dashboard--cached
-                      :prompt inst
-                      (lambda ()
-                        (claude-dashboard--last-prompt-for
-                         (claude-dashboard-instance-cwd inst))))
-                     ""))
-         (prompt-trunc (if (> (length prompt) 60)
-                           (concat (substring prompt 0 57) "...")
-                         prompt)))
-    (format claude-dashboard--row-format
+                  "—")))
+    (format (claude-dashboard--row-format branch-w worktree-w)
             (if (gethash (claude-dashboard-instance-buffer inst)
                          claude-dashboard--marks)
                 (propertize "*" 'face 'warning)
               " ")
             glyph
-            (truncate-string-to-width proj 20 nil ?\s "…")
-            (symbol-name status)
+            (propertize (truncate-string-to-width proj 20 nil ?\s "…")
+                        'face `(:foreground ,root-color :weight bold))
+            (propertize (claude-dashboard--state-abbrev status)
+                        'face (claude-dashboard--state-face status))
             uptime
-            (or idle "—")
-            (truncate-string-to-width branch 14 nil ?\s "…")
-            (truncate-string-to-width worktree 14 nil ?\s "…")
-            (truncate-string-to-width model 20 nil ?\s "…")
+            (truncate-string-to-width branch branch-w nil ?\s "…")
+            (truncate-string-to-width worktree worktree-w nil ?\s "…")
             sid
-            (claude-dashboard--status-snippet
-             (claude-dashboard-instance-cwd inst))
-            (propertize prompt-trunc 'face 'font-lock-comment-face))))
+            (claude-dashboard--status-snippet cwd)
+            (propertize (claude-dashboard--shorten-path cwd path-w)
+                        'face 'font-lock-comment-face))))
 
-(defun claude-dashboard--insert-instance-section (inst)
+(defun claude-dashboard--insert-instance-section (inst branch-w worktree-w path-w)
   (magit-insert-section (claude-dashboard-instance-section inst)
-    (insert (claude-dashboard--format-instance-line inst))
+    (insert (claude-dashboard--format-instance-line
+             inst branch-w worktree-w path-w))
     (insert "\n")))
-
-(defun claude-dashboard--insert-group (cwd insts)
-  (magit-insert-section (claude-dashboard-group-section cwd)
-    (magit-insert-heading
-      (propertize (format "%s  (%d)"
-                          (abbreviate-file-name cwd)
-                          (length insts))
-                  'face 'magit-section-heading))
-    (insert (claude-dashboard--header-line) "\n")
-    (dolist (inst insts)
-      (claude-dashboard--insert-instance-section inst))))
 
 (defun claude-dashboard--render ()
   "Replace the current buffer's contents with a fresh dashboard."
@@ -879,26 +1017,40 @@ model, session, status-age, last-prompt.")
       (magit-insert-heading
         (propertize (format "Claude instances (%d)" (length instances))
                     'face 'magit-section-heading))
-      (if (null instances)
-          (insert "  (no instances — press N to launch)\n")
-        (let ((groups (make-hash-table :test 'equal)))
-          (dolist (inst instances)
-            (let ((root (claude-dashboard--cached
-                         :main-worktree inst
-                         (lambda ()
-                           (claude-dashboard--main-worktree
-                            (claude-dashboard-instance-cwd inst))))))
-              (puthash root
-                       (cons inst (gethash root groups))
-                       groups)))
-          (let (group-list)
-            (maphash (lambda (root insts)
-                       (push (cons root (nreverse insts)) group-list))
-                     groups)
-            (setq group-list
-                  (sort group-list (lambda (a b) (string< (car a) (car b)))))
-            (dolist (g group-list)
-              (claude-dashboard--insert-group (car g) (cdr g)))))))))
+      (let* ((branches (mapcar #'claude-dashboard--instance-branch instances))
+             (worktrees (mapcar #'claude-dashboard--instance-worktree instances))
+             (branch-w (claude-dashboard--column-width
+                        "BRANCH" branches
+                        claude-dashboard-branch-max-width))
+             (worktree-w (claude-dashboard--column-width
+                          "WORKTREE" worktrees
+                          claude-dashboard-worktree-max-width))
+             ;; Fixed-width chunk before PATH:
+             ;; " M G PROJECT(20) ST(3) UP(5) BRANCH WORKTREE SESSION(8) STATUS(5)  "
+             (prefix-w (+ 1 1 1 1 1 20 1 3 1 5 1 branch-w 1 worktree-w 1 8 1 5 2))
+             (win (get-buffer-window (current-buffer) 'visible))
+             (frame-w (if win (window-text-width win) (frame-text-width)))
+             (path-w (max 12 (- frame-w prefix-w))))
+        (insert (claude-dashboard--header-line branch-w worktree-w) "\n")
+        (if (null instances)
+            (insert "  (no instances — press N to launch)\n")
+          (let ((sorted
+                 (sort (copy-sequence instances)
+                       (lambda (a b)
+                         (let ((ra (claude-dashboard--cached
+                                    :main-worktree a
+                                    (lambda ()
+                                      (claude-dashboard--main-worktree
+                                       (claude-dashboard-instance-cwd a)))))
+                               (rb (claude-dashboard--cached
+                                    :main-worktree b
+                                    (lambda ()
+                                      (claude-dashboard--main-worktree
+                                       (claude-dashboard-instance-cwd b))))))
+                           (string< ra rb))))))
+            (dolist (inst sorted)
+              (claude-dashboard--insert-instance-section
+               inst branch-w worktree-w path-w))))))))
 
 (defun claude-dashboard--maybe-refresh ()
   "Re-render the dashboard if its buffer is live."
@@ -986,6 +1138,8 @@ model, session, status-age, last-prompt.")
   :group 'claude-dashboard
   (setq-local truncate-lines t)
   (setq buffer-read-only t)
+  (setq-local font-lock-defaults nil)
+  (font-lock-mode -1)
   (unless claude-dashboard--refresh-timer
     (setq claude-dashboard--refresh-timer
           (run-with-timer claude-dashboard-refresh-interval
