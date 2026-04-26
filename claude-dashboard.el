@@ -74,6 +74,9 @@ Set to nil to disable the STATUS.md feature entirely."
 (defvar claude-dashboard--instances (make-hash-table :test 'eq)
   "Map from eat buffer to `claude-dashboard-instance' struct.")
 
+(defvar claude-dashboard--marks (make-hash-table :test 'eq)
+  "Set of marked instance buffers (value t).")
+
 (defvar claude-dashboard--refresh-timer nil
   "Idle timer rendering the dashboard when visible.")
 
@@ -591,6 +594,95 @@ With prefix arg or when called from a row, restrict to that row's cwd."
       (magit-status-setup-buffer (claude-dashboard-instance-cwd inst))
     (user-error "Magit is not loaded")))
 
+(defun claude-dashboard--marked-instances ()
+  "Return a list of currently marked, still-live instances."
+  (let (result)
+    (maphash (lambda (buf _)
+               (let ((inst (gethash buf claude-dashboard--instances)))
+                 (when (and inst (buffer-live-p buf))
+                   (push inst result))))
+             claude-dashboard--marks)
+    (nreverse result)))
+
+(defun claude-dashboard--instances-for-bulk ()
+  "Return the marked instances, or a list of just the one at point."
+  (or (claude-dashboard--marked-instances)
+      (list (claude-dashboard--current-instance))))
+
+(defun claude-dashboard-next-line (&optional n)
+  "Move to the next instance row (skipping group headers)."
+  (interactive "p")
+  (let ((n (or n 1)))
+    (dotimes (_ (abs n))
+      (forward-line (if (>= n 0) 1 -1))
+      ;; Skip non-instance lines (headers, blanks).
+      (while (and (not (eobp)) (not (bobp))
+                  (let* ((sec (magit-current-section))
+                         (val (and sec (oref sec value))))
+                    (not (claude-dashboard-instance-p val))))
+        (forward-line (if (>= n 0) 1 -1))))))
+
+(defun claude-dashboard-previous-line (&optional n)
+  "Move to the previous instance row."
+  (interactive "p")
+  (claude-dashboard-next-line (- (or n 1))))
+
+(defun claude-dashboard-mark (&optional n)
+  "Mark the current instance row and advance N lines (default 1)."
+  (interactive "p")
+  (let ((inst (claude-dashboard--current-instance)))
+    (puthash (claude-dashboard-instance-buffer inst) t
+             claude-dashboard--marks)
+    (claude-dashboard--maybe-refresh)
+    (claude-dashboard-next-line (or n 1))))
+
+(defun claude-dashboard-unmark (&optional n)
+  "Unmark the current instance row and advance N lines."
+  (interactive "p")
+  (let ((inst (claude-dashboard--current-instance)))
+    (remhash (claude-dashboard-instance-buffer inst)
+             claude-dashboard--marks)
+    (claude-dashboard--maybe-refresh)
+    (claude-dashboard-next-line (or n 1))))
+
+(defun claude-dashboard-toggle-marks ()
+  "Toggle marks on every instance row."
+  (interactive)
+  (dolist (inst (claude-dashboard--instances-list))
+    (let ((buf (claude-dashboard-instance-buffer inst)))
+      (if (gethash buf claude-dashboard--marks)
+          (remhash buf claude-dashboard--marks)
+        (puthash buf t claude-dashboard--marks))))
+  (claude-dashboard--maybe-refresh))
+
+(defun claude-dashboard-unmark-all ()
+  "Remove all marks."
+  (interactive)
+  (clrhash claude-dashboard--marks)
+  (claude-dashboard--maybe-refresh))
+
+(defun claude-dashboard-do-quit ()
+  "Gracefully quit all marked instances (or the one at point)."
+  (interactive)
+  (let ((targets (claude-dashboard--instances-for-bulk)))
+    (when (or (null (cdr targets))
+              (yes-or-no-p (format "Quit %d marked instance(s)? "
+                                   (length targets))))
+      (dolist (inst targets) (claude-dashboard-quit-instance inst))
+      (clrhash claude-dashboard--marks)
+      (claude-dashboard--maybe-refresh))))
+
+(defun claude-dashboard-do-kill ()
+  "Kill the eat buffer of all marked instances (or the one at point)."
+  (interactive)
+  (let ((targets (claude-dashboard--instances-for-bulk)))
+    (when (or (null (cdr targets))
+              (yes-or-no-p (format "Kill %d marked buffer(s)? "
+                                   (length targets))))
+      (dolist (inst targets) (claude-dashboard-kill-buffer inst))
+      (clrhash claude-dashboard--marks)
+      (claude-dashboard--maybe-refresh))))
+
 (defun claude-dashboard-visit-status (inst)
   "Open INST's STATUS.md in another window, creating it if missing."
   (interactive (list (claude-dashboard--current-instance)))
@@ -655,16 +747,16 @@ With prefix arg or when called from a row, restrict to that row's cwd."
 (defclass claude-dashboard-instance-section (magit-section) ())
 
 (defconst claude-dashboard--row-format
-  "  %s %-20s %-7s %5s %5s  %-14s %-14s %-20s %-8s %5s  %s"
+  " %s %s %-20s %-7s %5s %5s  %-14s %-14s %-20s %-8s %5s  %s"
   "Format string used for both the column header and each instance row.
-Columns: glyph, project, state, uptime, idle, branch, worktree, model,
-session, status-age, last-prompt.")
+Columns: mark, glyph, project, state, uptime, idle, branch, worktree,
+model, session, status-age, last-prompt.")
 
 (defun claude-dashboard--header-line ()
   "Return the column header line, faced as a section heading."
   (propertize
    (format claude-dashboard--row-format
-           " " "PROJECT" "STATE" "UP" "IDLE" "BRANCH" "WORKTREE" "MODEL"
+           " " " " "PROJECT" "STATE" "UP" "IDLE" "BRANCH" "WORKTREE" "MODEL"
            "SESSION" "STATUS" "LAST PROMPT")
    'face 'magit-section-heading))
 
@@ -708,6 +800,10 @@ session, status-age, last-prompt.")
                            (concat (substring prompt 0 57) "...")
                          prompt)))
     (format claude-dashboard--row-format
+            (if (gethash (claude-dashboard-instance-buffer inst)
+                         claude-dashboard--marks)
+                (propertize "*" 'face 'warning)
+              " ")
             glyph
             (truncate-string-to-width proj 20 nil ?\s "…")
             (symbol-name status)
@@ -782,19 +878,26 @@ session, status-age, last-prompt.")
 
 (transient-define-prefix claude-dashboard-menu ()
   "Claude dashboard actions."
-  ["Instance"
+  ["Visit"
    ("RET" "visit"           claude-dashboard-visit)
    ("o"   "visit"           claude-dashboard-visit)
    ("O"   "display other"   claude-dashboard-display)
    ("d"   "dired cwd"       claude-dashboard-dired)
-   ("m"   "magit-status"    claude-dashboard-magit)
+   ("v"   "magit-status"    claude-dashboard-magit)
    ("s"   "STATUS.md"       claude-dashboard-visit-status)]
-  ["Lifecycle"
-   ("k"   "quit (graceful)" claude-dashboard-quit-instance)
-   ("K"   "kill buffer"     claude-dashboard-kill-buffer)
-   ("r"   "restart"         claude-dashboard-restart)]
+  ["Marks"
+   ("m"   "mark"            claude-dashboard-mark)
+   ("u"   "unmark"          claude-dashboard-unmark)
+   ("t"   "toggle marks"    claude-dashboard-toggle-marks)
+   ("U"   "unmark all"      claude-dashboard-unmark-all)]
+  ["Lifecycle (marked or row)"
+   ("k"   "quit (row)"      claude-dashboard-quit-instance)
+   ("K"   "kill buf (row)"  claude-dashboard-kill-buffer)
+   ("r"   "restart (row)"   claude-dashboard-restart)
+   ("D"   "quit marked"     claude-dashboard-do-quit)
+   ("x"   "kill marked"     claude-dashboard-do-kill)]
   ["Dashboard"
-   ("n"   "new instance"    claude-dashboard-new)
+   ("N"   "new instance"    claude-dashboard-new)
    ("c"   "continue (cwd)"  claude-dashboard-continue)
    ("R"   "resume (picker)" claude-dashboard-resume)
    ("g"   "refresh"         claude-dashboard-refresh)
@@ -805,16 +908,32 @@ session, status-age, last-prompt.")
 (defvar claude-dashboard-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map magit-section-mode-map)
+    ;; Navigation (ibuffer-style)
+    (define-key map "n"         #'claude-dashboard-next-line)
+    (define-key map "p"         #'claude-dashboard-previous-line)
+    (define-key map (kbd "SPC") #'claude-dashboard-next-line)
+    ;; Visit
     (define-key map (kbd "RET") #'claude-dashboard-visit)
     (define-key map "o"         #'claude-dashboard-visit)
     (define-key map "O"         #'claude-dashboard-display)
+    ;; Marks (ibuffer-style)
+    (define-key map "m"         #'claude-dashboard-mark)
+    (define-key map "u"         #'claude-dashboard-unmark)
+    (define-key map "t"         #'claude-dashboard-toggle-marks)
+    (define-key map "U"         #'claude-dashboard-unmark-all)
+    ;; Bulk operations on marked rows (or current row if none marked)
+    (define-key map "D"         #'claude-dashboard-do-quit)
+    (define-key map (kbd "x")   #'claude-dashboard-do-kill)
+    ;; Per-row jumps
     (define-key map "d"         #'claude-dashboard-dired)
-    (define-key map "m"         #'claude-dashboard-magit)
+    (define-key map "v"         #'claude-dashboard-magit)
     (define-key map "s"         #'claude-dashboard-visit-status)
+    ;; Lifecycle on the row at point
     (define-key map "k"         #'claude-dashboard-quit-instance)
     (define-key map "K"         #'claude-dashboard-kill-buffer)
     (define-key map "r"         #'claude-dashboard-restart)
-    (define-key map "n"         #'claude-dashboard-new)
+    ;; Dashboard-level
+    (define-key map "N"         #'claude-dashboard-new)
     (define-key map "c"         #'claude-dashboard-continue)
     (define-key map "R"         #'claude-dashboard-resume)
     (define-key map "g"         #'claude-dashboard-refresh)

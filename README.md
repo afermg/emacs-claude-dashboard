@@ -44,19 +44,27 @@ Or load manually:
 
 `M-x claude-dashboard` opens the dashboard buffer.
 
+Keybindings follow ibuffer's conventions: `n`/`p` move between rows,
+`m`/`u`/`t`/`U` mark/unmark/toggle/unmark-all, `D` and `x` operate on
+all marked rows (or the current row if no marks). Capitalised `N`
+launches a new instance, freeing single-letter `n` for navigation.
+
 | Key   | Action                                 |
 | ----- | -------------------------------------- |
-| `n`   | new Claude instance (prompts for cwd)  |
-| `c`   | `claude --continue` in chosen cwd      |
-| `R`   | resume picker (all past sessions); on a row, defaults to that cwd |
+| `n` / `p` / `SPC` | next / previous instance row |
 | `RET` / `o` | pop to instance buffer            |
 | `O`   | display instance buffer in other window |
 | `d`   | dired in instance cwd                  |
-| `m`   | magit-status on instance cwd           |
+| `v`   | magit-status on instance cwd           |
 | `s`   | open the instance's STATUS.md          |
-| `k`   | quit Claude gracefully (SIGINT)        |
-| `K`   | kill the eat buffer outright           |
-| `r`   | restart Claude in same buffer/cwd      |
+| `m` / `u` | mark / unmark current row          |
+| `t` / `U` | toggle all marks / unmark all      |
+| `D`   | quit (graceful) marked, or current     |
+| `x`   | kill eat buffer for marked, or current |
+| `k` / `K` / `r` | quit / kill buffer / restart current row |
+| `N`   | new Claude instance (prompts for cwd)  |
+| `c`   | `claude --continue` in chosen cwd      |
+| `R`   | resume picker (all past sessions); on a row, defaults to that cwd |
 | `g`   | refresh                                |
 | `?`   | transient menu                         |
 | `TAB` | fold/unfold a section                  |
