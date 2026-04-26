@@ -83,11 +83,12 @@ then directories from `recentf-list`, then a free-form `read-directory-name`.
   and `r` to restart. `K` removes it.
 - A `STATUS.md` file is created in each instance's cwd on launch (with a
   starter template). The dashboard's `STATUS` column shows how long ago
-  it was last modified. Press `s` to visit. Claude **does not** write to
-  this file automatically — to make it useful, ask Claude in your first
-  prompt to keep `STATUS.md` updated, e.g. _"Update STATUS.md after each
-  significant step with what you did and what's next."_  Disable entirely
-  by `(setq claude-dashboard-status-file nil)`.
+  it was last modified. Press `s` to visit.
+- The launch automatically injects `--append-system-prompt` instructing
+  Claude to keep `STATUS.md` current after every meaningful step. Tune
+  the wording via `claude-dashboard-status-system-prompt`, or set it to
+  `nil` to skip the injection. Disable the whole feature with
+  `(setq claude-dashboard-status-file nil)`.
 - `~/.claude/sessions/<pid>.json` is read ~2s after launch to fill in the
   session id. The model is read from the latest JSONL in
   `~/.claude/projects/<encoded-cwd>/` once Claude has produced an assistant

@@ -64,6 +64,17 @@ The file is created on launch with a starter template if missing.
 Set to nil to disable the STATUS.md feature entirely."
   :type '(choice (const :tag "Disabled" nil) (string :tag "Relative path")))
 
+(defcustom claude-dashboard-status-system-prompt
+  "Maintain ./STATUS.md as a brief, current snapshot of this session: \
+what you just did, what you're doing now, and what's next. Update it \
+after every meaningful step (file edit, command, decision). Keep it \
+short (≤ 30 lines)."
+  "System-prompt fragment auto-appended to each launch.
+Passed through `--append-system-prompt' so Claude keeps
+`claude-dashboard-status-file' up to date.  Set to nil to disable
+injection."
+  :type '(choice (const :tag "Disabled" nil) (string :tag "Prompt fragment")))
+
 ;;; Data model
 
 (cl-defstruct claude-dashboard-instance
@@ -529,12 +540,22 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
   (remhash (current-buffer) claude-dashboard--instances)
   (claude-dashboard--maybe-refresh))
 
+(defun claude-dashboard--status-injected-args ()
+  "Return the `--append-system-prompt' args that ask Claude to maintain STATUS.md.
+Empty list when either the file or the prompt is disabled."
+  (when (and claude-dashboard-status-file
+             claude-dashboard-status-system-prompt)
+    (list "--append-system-prompt"
+          claude-dashboard-status-system-prompt)))
+
 (defun claude-dashboard--launch (cwd extra-args)
   "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer."
   (let* ((default-directory cwd)
          (name (claude-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
-         (args (append claude-dashboard-program-args extra-args)))
+         (args (append claude-dashboard-program-args
+                       (claude-dashboard--status-injected-args)
+                       extra-args)))
     (claude-dashboard--ensure-status-file cwd)
     (with-current-buffer buf
       (unless (derived-mode-p 'eat-mode)
