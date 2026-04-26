@@ -69,7 +69,7 @@ Set to nil to disable the STATUS.md feature entirely."
 (cl-defstruct claude-dashboard-instance
   buffer cwd started-at last-output
   session-id model
-  branch-cache worktree-cache last-prompt-cache)
+  branch-cache worktree-cache main-worktree-cache last-prompt-cache)
 
 (defvar claude-dashboard--instances (make-hash-table :test 'eq)
   "Map from eat buffer to `claude-dashboard-instance' struct.")
@@ -141,6 +141,20 @@ One of `running', `idle', or `exited'."
                                    "symbolic-ref" "--short" "-q" "HEAD"))
           (string-trim (buffer-string)))))))
 
+(defun claude-dashboard--main-worktree (cwd)
+  "Return the main worktree directory for CWD's repo.
+Falls back to CWD when CWD is not inside a git repository."
+  (or
+   (when (file-directory-p cwd)
+     (with-temp-buffer
+       (let ((default-directory cwd))
+         (when (zerop (process-file "git" nil t nil
+                                    "worktree" "list" "--porcelain"))
+           (goto-char (point-min))
+           (when (re-search-forward "^worktree \\(.+\\)$" nil t)
+             (file-name-as-directory (match-string 1)))))))
+   (file-name-as-directory cwd)))
+
 (defun claude-dashboard--worktree-name (cwd)
   "If CWD is a linked git worktree, return its name (final dir of `.git').
 For the main checkout return \"main\".  For non-git directories return nil."
@@ -161,6 +175,7 @@ For the main checkout return \"main\".  For non-git directories return nil."
   (let* ((cur (pcase slot
                 (:branch (claude-dashboard-instance-branch-cache inst))
                 (:worktree (claude-dashboard-instance-worktree-cache inst))
+                (:main-worktree (claude-dashboard-instance-main-worktree-cache inst))
                 (:prompt (claude-dashboard-instance-last-prompt-cache inst))))
          (now (float-time)))
     (if (and cur (< (- now (cdr cur)) claude-dashboard-cache-ttl))
@@ -170,6 +185,7 @@ For the main checkout return \"main\".  For non-git directories return nil."
         (pcase slot
           (:branch (setf (claude-dashboard-instance-branch-cache inst) entry))
           (:worktree (setf (claude-dashboard-instance-worktree-cache inst) entry))
+          (:main-worktree (setf (claude-dashboard-instance-main-worktree-cache inst) entry))
           (:prompt (setf (claude-dashboard-instance-last-prompt-cache inst) entry)))
         value))))
 
@@ -843,16 +859,20 @@ model, session, status-age, last-prompt.")
         (propertize (format "Claude instances (%d)" (length instances))
                     'face 'magit-section-heading))
       (if (null instances)
-          (insert "  (no instances — press n to launch)\n")
+          (insert "  (no instances — press N to launch)\n")
         (let ((groups (make-hash-table :test 'equal)))
           (dolist (inst instances)
-            (let ((cwd (claude-dashboard-instance-cwd inst)))
-              (puthash cwd
-                       (cons inst (gethash cwd groups))
+            (let ((root (claude-dashboard--cached
+                         :main-worktree inst
+                         (lambda ()
+                           (claude-dashboard--main-worktree
+                            (claude-dashboard-instance-cwd inst))))))
+              (puthash root
+                       (cons inst (gethash root groups))
                        groups)))
           (let (group-list)
-            (maphash (lambda (cwd insts)
-                       (push (cons cwd (nreverse insts)) group-list))
+            (maphash (lambda (root insts)
+                       (push (cons root (nreverse insts)) group-list))
                      groups)
             (setq group-list
                   (sort group-list (lambda (a b) (string< (car a) (car b)))))
