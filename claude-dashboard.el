@@ -158,34 +158,235 @@ cursor, anchoring the match to the visible bottom of the terminal."
 
 (defcustom claude-dashboard-monitoring-regexp
   "[0-9]+m[ \t]+[0-9]+s[^\n]*esc to interrupt"
-  "Regexp matched against the tail of the eat buffer.
+  "Regexp for a *live* monitoring spinner in the eat buffer tail.
 Matches a Claude Code progress spinner whose elapsed time has
-crossed one minute (e.g. `1m 30s · ↑ 2k tokens · esc to interrupt'),
-indicating the agent is monitoring an external long-running tool."
+crossed one minute (e.g. `1m 30s · ↑ 2k tokens · esc to interrupt')."
   :type 'regexp :group 'claude-dashboard)
 
 (defcustom claude-dashboard-monitoring-tail-chars 400
   "Trailing eat-buffer chars to scan for a live monitoring spinner.
-Tighter than the awaiting window — a fresh spinner update sits near
-the very bottom; once Claude streams a few hundred chars of new
-output past it the row drops out of monitoring."
+Tight enough that once the tool finishes and Claude streams a few
+hundred chars of new output, the spinner falls out of the window."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-auto-name-after-turns 5
+  "Send `/name <topic>' once an instance reaches this many user turns.
+The injected name is derived from the first user prompt (lowercased,
+kebab-cased, capped at ~30 chars).  Set to nil to disable the auto-
+naming entirely.  Only fires when the agent is `idle' so a stray
+keystroke doesn't interrupt mid-stream output."
+  :type '(choice (const :tag "Disabled" nil) (integer :tag "Turn threshold"))
+  :group 'claude-dashboard)
+
+(defvar claude-dashboard--name-injected (make-hash-table :test 'eq)
+  "Set of buffers we've already sent `/name' to (value t).")
+
+(defvar claude-dashboard--worktree-names (make-hash-table :test 'eq)
+  "Map buffer → branch/worktree name when launched via the
+worktree workflow.  Used as the immediate TOPIC value and as the
+slug sent to `/name' once the agent is ready (skipping the usual
+turn-threshold wait).")
+
+(defun claude-dashboard--count-user-turns (cwd sid)
+  "Return the number of `type:user' entries in SID's transcript, or 0."
+  (or (and cwd sid
+           (let* ((proj-dir (expand-file-name
+                             (format "projects/%s"
+                                     (claude-dashboard--encode-cwd cwd))
+                             claude-dashboard-claude-dir))
+                  (file (expand-file-name (concat sid ".jsonl") proj-dir)))
+             (when (file-readable-p file)
+               (with-temp-buffer
+                 (insert-file-contents file)
+                 (goto-char (point-min))
+                 (let ((n 0))
+                   (while (not (eobp))
+                     (when (looking-at "{[^\n]*\"type\":\"user\"")
+                       (setq n (1+ n)))
+                     (forward-line 1))
+                   n)))))
+      0))
+
+(defun claude-dashboard--kebab-from-prompt (prompt)
+  "Turn PROMPT into a short kebab-case slug suitable for `/name'."
+  (when (and prompt (stringp prompt))
+    (let* ((stripped (replace-regexp-in-string "[^[:alnum:][:space:]]" " "
+                                               (downcase prompt)))
+           (words (seq-filter
+                   (lambda (w) (and (> (length w) 1)
+                                    (not (member w '("the" "a" "an" "is"
+                                                     "are" "was" "were"
+                                                     "and" "or" "but" "to"
+                                                     "of" "in" "on" "for"
+                                                     "with" "this" "that"
+                                                     "it" "i" "we" "you"
+                                                     "do" "does" "did"
+                                                     "can" "could" "would"
+                                                     "should" "be" "been"
+                                                     "have" "has" "had"
+                                                     "my" "your")))))
+                   (split-string stripped "[[:space:]]+" t)))
+           (chosen (seq-take words 5))
+           (slug (mapconcat #'identity chosen "-")))
+      (when (> (length slug) 0)
+        (substring slug 0 (min 30 (length slug)))))))
+
+(defun claude-dashboard--maybe-auto-name (inst)
+  "Send `/name <slug>' when an instance is ready for one.
+Two trigger paths:
+- INST was launched via the worktree workflow — fire immediately on
+  first idle, using the registered worktree/branch name.
+- Otherwise, wait until INST has had at least
+  `claude-dashboard-auto-name-after-turns' user turns, then derive
+  a slug from the first prompt.
+Either way, only fires once per buffer (tracked via
+`claude-dashboard--name-injected') and only when the agent is `idle'
+so the keystroke doesn't collide with active output."
+  (let* ((buf (claude-dashboard-instance-buffer inst))
+         (cwd (claude-dashboard-instance-cwd inst))
+         (sid (or (claude-dashboard--live-session-id inst)
+                  (claude-dashboard-instance-session-id inst)))
+         (proc (claude-dashboard--instance-process inst))
+         (preassigned (and buf (gethash buf claude-dashboard--worktree-names))))
+    (when (and buf (buffer-live-p buf) cwd proc (process-live-p proc)
+               (not (gethash buf claude-dashboard--name-injected))
+               (eq (claude-dashboard--status inst) 'idle)
+               (or preassigned
+                   (and claude-dashboard-auto-name-after-turns
+                        sid
+                        (null (claude-dashboard--session-name-from-transcript
+                               cwd sid))
+                        (>= (claude-dashboard--count-user-turns cwd sid)
+                            claude-dashboard-auto-name-after-turns))))
+      (let ((slug (or preassigned
+                      (claude-dashboard--kebab-from-prompt
+                       (claude-dashboard--first-prompt-from-transcript
+                        cwd sid)))))
+        (when (and slug (not (string-empty-p slug)))
+          (puthash buf t claude-dashboard--name-injected)
+          (process-send-string proc (format "/name %s\n" slug))
+          (message "claude-dashboard: named %s → %s"
+                   (buffer-name buf) slug))))))
+
+(defun claude-dashboard-copy-topic ()
+  "Copy the topic of the instance at point to the kill ring.
+Uses the same resolution chain as the displayed TOPIC column —
+custom name set via `/name' first, then derived prompts, with the
+auto-assigned slug as the last fallback."
+  (interactive)
+  (let* ((inst (claude-dashboard--current-instance))
+         (topic (claude-dashboard--instance-topic inst)))
+    (if (and topic (not (string= topic "—")))
+        (progn
+          (kill-new topic)
+          (message "Copied: %s" topic))
+      (user-error "No topic available for this instance"))))
+
+(defun claude-dashboard-name-instance ()
+  "Manually send `/name <slug>' to the instance at point.
+Prompts for a name (default derived from the session's first
+user prompt).  Useful when you want to override or backfill."
+  (interactive)
+  (let* ((inst (claude-dashboard--current-instance))
+         (cwd (claude-dashboard-instance-cwd inst))
+         (sid (or (claude-dashboard--live-session-id inst)
+                  (claude-dashboard-instance-session-id inst)))
+         (default (or (and cwd sid
+                           (claude-dashboard--kebab-from-prompt
+                            (claude-dashboard--first-prompt-from-transcript
+                             cwd sid)))
+                      ""))
+         (name (read-string (format "/name (default %s): " default)
+                            nil nil default))
+         (proc (claude-dashboard--instance-process inst)))
+    (unless (and proc (process-live-p proc))
+      (user-error "Instance has no live process"))
+    (process-send-string proc (format "/name %s\n" name))
+    (puthash (claude-dashboard-instance-buffer inst) t
+             claude-dashboard--name-injected)
+    (message "Sent /name %s to %s" name
+             (buffer-name (claude-dashboard-instance-buffer inst)))))
+
+(defcustom claude-dashboard-monitoring-keywords-regexp
+  (concat "\\(?:"
+          "pgrep\\|pidof\\|\\bps \\b\\|ps -\\b\\|ps a\\b"
+          "\\|tail -[fnFN]"
+          "\\|screen -ls\\|tmux ls\\|watch \\b"
+          "\\|journalctl\\|systemctl status"
+          "\\|nvidia-smi\\|rocm-smi\\|htop\\|top -b"
+          "\\|kubectl get\\|kubectl logs\\|docker ps\\|docker logs"
+          "\\|\\bsleep [0-9]\\|ping \\b"
+          "\\)")
+  "Regexp of shell verbs that read process / log / cluster state.
+Used to classify the agent's *most recent* Bash tool call as
+monitoring vs. one-shot work."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitoring-intent-regexp
+  "^●\\s-+\\(?:Sleeping\\|Waiting\\|Polling\\|Monitoring\\|Watching\\)\\b"
+  "Regexp matching an assistant message declaring monitoring intent.
+A message like `● Sleeping while nb03 exports.' means the agent is
+deliberately waiting on an external process even though no spinner
+or tool call is currently active."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitoring-cmd-tail-chars 2000
+  "Trailing eat-buffer chars to scan for the most recent Bash tool call.
+A monitoring agent's last tool call is its most recent poll, so this
+just needs to be wide enough to find that call between polls."
   :type 'integer :group 'claude-dashboard)
 
 (defun claude-dashboard--monitoring-p (inst)
-  "Return non-nil when INST appears to be waiting on a long-running tool.
-Anchored to `claude-dashboard-monitoring-tail-chars' so once the tool
-finishes and Claude emits new output the spinner falls out of the
-window."
+  "Return non-nil when INST appears to be monitoring an external process.
+Three signals (any one is enough):
+- a live `>1m … esc to interrupt' spinner in the very tail, OR
+- a recent `● Sleeping/Waiting/Polling/…' assistant message
+  declaring monitoring intent, OR
+- the agent's most-recent `● Bash(…)' tool call invokes a process /
+  log / cluster reader (the command body, including any wrapped
+  continuation lines, is matched against
+  `claude-dashboard-monitoring-keywords-regexp').
+Anchoring on the latest tool call avoids classifying every agent
+that ran `ps' once during investigation as monitoring."
   (when-let* ((buf (claude-dashboard-instance-buffer inst))
               ((buffer-live-p buf)))
     (with-current-buffer buf
       (save-excursion
-        (goto-char (point-max))
-        (let ((tail-start (max (point-min)
-                               (- (point-max)
-                                  claude-dashboard-monitoring-tail-chars))))
-          (re-search-backward claude-dashboard-monitoring-regexp
-                              tail-start t))))))
+        (or
+         ;; Live spinner: tight tail.
+         (let ((tail-start (max (point-min)
+                                (- (point-max)
+                                   claude-dashboard-monitoring-tail-chars))))
+           (goto-char (point-max))
+           (re-search-backward claude-dashboard-monitoring-regexp
+                               tail-start t))
+         ;; Explicit "Sleeping/Waiting/…" intent in a recent message.
+         (let ((tail-start (max (point-min)
+                                (- (point-max)
+                                   claude-dashboard-monitoring-cmd-tail-chars))))
+           (goto-char (point-max))
+           (re-search-backward claude-dashboard-monitoring-intent-regexp
+                               tail-start t))
+         ;; Latest executed bash tool call IS a monitoring one.
+         (let ((tail-start (max (point-min)
+                                (- (point-max)
+                                   claude-dashboard-monitoring-cmd-tail-chars))))
+           (goto-char (point-max))
+           (when (re-search-backward "●\\s-+Bash(" tail-start t)
+             (let* ((cmd-start (match-end 0))
+                    ;; Read up to the closing paren (or 800 chars cap),
+                    ;; spanning wrapped continuation lines so commands
+                    ;; like `… ; ps aux | …' on line 2 still count.
+                    (cmd-end (save-excursion
+                               (goto-char cmd-start)
+                               (if (re-search-forward
+                                    ")" (min (point-max) (+ cmd-start 800))
+                                    t)
+                                   (match-beginning 0)
+                                 (min (point-max) (+ cmd-start 800)))))
+                    (cmd (buffer-substring-no-properties cmd-start cmd-end)))
+               (string-match-p
+                claude-dashboard-monitoring-keywords-regexp cmd)))))))))
 
 (defun claude-dashboard--status (inst)
   "Return a symbol summarizing INST's current state.
@@ -707,6 +908,59 @@ Empty list when either the file or the prompt is disabled."
   (interactive (list (claude-dashboard--read-project)))
   (claude-dashboard--launch cwd nil))
 
+(defun claude-dashboard--worktree-target-dir (main-wt branch)
+  "Return Claude's standard worktree path: <MAIN-WT>/.claude/worktrees/<BRANCH>."
+  (file-name-as-directory
+   (expand-file-name (format ".claude/worktrees/%s" branch)
+                     main-wt)))
+
+;;;###autoload
+(defun claude-dashboard-new-worktree (source-cwd branch)
+  "Create a new git worktree + branch under SOURCE-CWD's repo, launch Claude.
+The worktree lands at `<main-worktree>/.claude/worktrees/<BRANCH>'
+\(Claude Code's standard layout) and is checked out on a freshly
+created `<BRANCH>'.  The agent is launched in that directory and
+its TOPIC is pre-bound to BRANCH — the dashboard displays it
+immediately and a `/name BRANCH' is sent to the live process on
+first idle so the value sticks in Claude's transcript metadata
+too.
+
+Interactively, prompts for both arguments.  If point is on an
+instance row, that row's cwd is offered as the SOURCE-CWD default."
+  (interactive
+   (let* ((default-cwd
+           (or (and (eq major-mode 'claude-dashboard-mode)
+                    (ignore-errors
+                      (claude-dashboard-instance-cwd
+                       (claude-dashboard--current-instance))))
+               (claude-dashboard--read-project)))
+          (branch (read-string "New branch / worktree name: ")))
+     (list default-cwd branch)))
+  (when (or (null branch) (string-empty-p (string-trim branch)))
+    (user-error "Branch name is required"))
+  (let* ((branch (string-trim branch))
+         (main-wt (claude-dashboard--main-worktree source-cwd))
+         (target (claude-dashboard--worktree-target-dir main-wt branch)))
+    (when (file-exists-p (directory-file-name target))
+      (user-error "Worktree path already exists: %s" target))
+    (let ((parent (file-name-directory (directory-file-name target))))
+      (unless (file-directory-p parent)
+        (make-directory parent t)))
+    (with-temp-buffer
+      (let* ((default-directory main-wt)
+             (rc (process-file "git" nil t nil
+                               "worktree" "add"
+                               "-b" branch
+                               (directory-file-name target))))
+        (unless (zerop rc)
+          (error "git worktree add failed: %s" (buffer-string)))))
+    (let ((buf (claude-dashboard--launch target nil)))
+      (puthash buf branch claude-dashboard--worktree-names)
+      ;; Register branch as the deploy-branch too, since the agent will
+      ;; start on this exact branch — saves us the live git read.
+      (puthash buf branch claude-dashboard--deploy-branches)
+      buf)))
+
 ;;;###autoload
 (defun claude-dashboard-continue (cwd)
   "Run `claude --continue' in CWD, resuming the most recent session there."
@@ -918,6 +1172,10 @@ With prefix arg or when called from a row, restrict to that row's cwd."
 (defclass claude-dashboard-group-section (magit-section) ())
 (defclass claude-dashboard-instance-section (magit-section) ())
 
+(defcustom claude-dashboard-project-max-width 14
+  "Hard cap on the PROJECT column width."
+  :type 'integer :group 'claude-dashboard)
+
 (defcustom claude-dashboard-branch-max-width 24
   "Hard cap on the BRANCH column width."
   :type 'integer :group 'claude-dashboard)
@@ -972,6 +1230,74 @@ covered separately by `claude-dashboard--first-prompt-from-transcript'."
                   (when (and parsed
                              (equal sid (alist-get 'sessionId parsed)))
                     (throw 'found (alist-get 'display parsed)))))
+              (forward-line 1))
+            nil))))))
+
+(defun claude-dashboard--session-name-from-transcript (cwd sid)
+  "Return the latest custom title for SID, or nil when none has been set.
+Reads `~/.claude/projects/<slug>/<SID>.jsonl' looking for the most
+recent `{\"type\":\"custom-title\", \"customTitle\": \"…\"}' entry.
+Claude Code's `/name <name>' slash command writes such a line, so
+when the user has named the conversation we report that name as the
+TOPIC."
+  (when (and cwd sid)
+    (let* ((proj-dir (expand-file-name
+                      (format "projects/%s"
+                              (claude-dashboard--encode-cwd cwd))
+                      claude-dashboard-claude-dir))
+           (file (expand-file-name (concat sid ".jsonl") proj-dir)))
+      (when (file-readable-p file)
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-max))
+          (catch 'found
+            (while (not (bobp))
+              (forward-line -1)
+              (when (looking-at "{")
+                (let ((parsed (ignore-errors
+                                (json-parse-buffer
+                                 :object-type 'alist
+                                 :array-type 'list
+                                 :null-object nil
+                                 :false-object nil))))
+                  (goto-char (line-beginning-position))
+                  (when (and parsed
+                             (equal "custom-title"
+                                    (alist-get 'type parsed)))
+                    (let ((ct (alist-get 'customTitle parsed)))
+                      (when (and ct (not (string-empty-p ct)))
+                        (throw 'found ct)))))))
+            nil))))))
+
+(defun claude-dashboard--session-slug-from-transcript (cwd sid)
+  "Return Claude's auto-assigned slug for SID, or nil.
+The CLI tags every session with a kebab-case `slug' (e.g.
+`starry-mapping-cake') in transcript entries.  Less informative than
+a custom title or the first prompt, but better than `—'."
+  (when (and cwd sid)
+    (let* ((proj-dir (expand-file-name
+                      (format "projects/%s"
+                              (claude-dashboard--encode-cwd cwd))
+                      claude-dashboard-claude-dir))
+           (file (expand-file-name (concat sid ".jsonl") proj-dir)))
+      (when (file-readable-p file)
+        (with-temp-buffer
+          (insert-file-contents file nil 0 65536)
+          (goto-char (point-min))
+          (catch 'found
+            (while (not (eobp))
+              (when (looking-at "{")
+                (let ((parsed (ignore-errors
+                                (json-parse-buffer
+                                 :object-type 'alist
+                                 :array-type 'list
+                                 :null-object nil
+                                 :false-object nil))))
+                  (goto-char (line-beginning-position))
+                  (when parsed
+                    (let ((slug (alist-get 'slug parsed)))
+                      (when (and slug (not (string-empty-p slug)))
+                        (throw 'found slug))))))
               (forward-line 1))
             nil))))))
 
@@ -1049,10 +1375,12 @@ in the slug's project dir."
 
 (defun claude-dashboard--instance-topic (inst)
   "Return INST's topic, briefest relevant summary available.
-Resolution chain: STATUS.md heading → first user prompt in the live
-session's transcript → first user prompt in the cached session's
-transcript → first user prompt in `history.jsonl' → most-recent
-transcript in the project dir → \"—\"."
+The session name set inside Claude with `/name <foo>' is the
+absolute source of truth — it overrides every other candidate.
+Below it, the chain falls through: worktree-launch pre-assigned
+name → STATUS.md heading → first user prompt (transcript, then
+history.jsonl) → most-recent transcript in the project dir →
+auto-generated slug → \"—\"."
   (let* ((buf (claude-dashboard-instance-buffer inst))
          (cur (gethash buf claude-dashboard--topic-cache))
          (now (float-time)))
@@ -1061,15 +1389,30 @@ transcript in the project dir → \"—\"."
       (let* ((cwd (claude-dashboard-instance-cwd inst))
              (live-sid (claude-dashboard--live-session-id inst))
              (cached-sid (claude-dashboard-instance-session-id inst))
-             (val (or (claude-dashboard--status-md-topic cwd)
-                      (claude-dashboard--first-prompt-from-transcript
-                       cwd live-sid)
-                      (claude-dashboard--first-prompt-from-transcript
-                       cwd cached-sid)
-                      (claude-dashboard--first-prompt-for-session live-sid)
-                      (claude-dashboard--first-prompt-for-session cached-sid)
-                      (claude-dashboard--latest-transcript-prompt cwd)
-                      "—")))
+             (val (or
+                   ;; HIGHEST PRIORITY: a name set inside Claude via
+                   ;; `/name <foo>' wins over every other candidate.
+                   (claude-dashboard--session-name-from-transcript
+                    cwd live-sid)
+                   (claude-dashboard--session-name-from-transcript
+                    cwd cached-sid)
+                   ;; Worktree-launch pre-assigned name (used until the
+                   ;; matching `/name' lands in the transcript above).
+                   (gethash buf claude-dashboard--worktree-names)
+                   (claude-dashboard--status-md-topic cwd)
+                   (claude-dashboard--first-prompt-from-transcript
+                    cwd live-sid)
+                   (claude-dashboard--first-prompt-from-transcript
+                    cwd cached-sid)
+                   (claude-dashboard--first-prompt-for-session live-sid)
+                   (claude-dashboard--first-prompt-for-session cached-sid)
+                   (claude-dashboard--latest-transcript-prompt cwd)
+                   ;; Last resort: Claude's auto-generated slug.
+                   (claude-dashboard--session-slug-from-transcript
+                    cwd live-sid)
+                   (claude-dashboard--session-slug-from-transcript
+                    cwd cached-sid)
+                   "—")))
         ;; Promote the live session-id back into the struct so the next
         ;; render skips the stale cached id.
         (when (and live-sid (not (equal live-sid cached-sid)))
@@ -1079,8 +1422,8 @@ transcript in the project dir → \"—\"."
 
 (defun claude-dashboard--row-format (branch-w topic-w)
   "Return the row format with dynamic BRANCH-W and TOPIC-W widths."
-  (format "%%s %%s %%-20s %%-3s %%5s %%-%ds %%-8s %%5s  %%-%ds"
-          branch-w topic-w))
+  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%5s  %%-%ds"
+          claude-dashboard-project-max-width branch-w topic-w))
 
 (defun claude-dashboard--instance-deploy-branch (inst)
   "Return the branch INST was deployed against, falling back to live."
@@ -1217,7 +1560,8 @@ segment intact, elides intermediate components with `…/'."
                 (propertize "*" 'face 'warning)
               " ")
             glyph
-            (propertize (truncate-string-to-width proj 20 nil ?\s "…")
+            (propertize (truncate-string-to-width
+                         proj claude-dashboard-project-max-width nil ?\s "…")
                         'face `(:foreground ,root-color :weight bold))
             (propertize (claude-dashboard--state-abbrev status)
                         'face (claude-dashboard--state-face status))
@@ -1249,7 +1593,8 @@ segment intact, elides intermediate components with `…/'."
              (branch-w (claude-dashboard--column-width
                         "BRANCH" branches
                         claude-dashboard-branch-max-width))
-             (prefix-w (+ 1 1 1 1 20 1 3 1 5 1 branch-w 1 8 1 5 2))
+             (prefix-w (+ 1 1 1 1 claude-dashboard-project-max-width
+                            1 3 1 5 1 branch-w 1 8 1 5 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
              (topic-w (max 16 (- frame-w prefix-w))))
@@ -1277,6 +1622,10 @@ segment intact, elides intermediate components with `…/'."
 
 (defun claude-dashboard--maybe-refresh ()
   "Re-render the dashboard if its buffer is live."
+  ;; Auto-naming runs ahead of render so a freshly-injected /name has a
+  ;; chance to land in the transcript before the topic resolver reads it.
+  (dolist (inst (claude-dashboard--instances-list))
+    (ignore-errors (claude-dashboard--maybe-auto-name inst)))
   (let ((buf (get-buffer claude-dashboard-buffer-name)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
@@ -1313,11 +1662,12 @@ segment intact, elides intermediate components with `…/'."
    ("D"   "quit marked"     claude-dashboard-do-quit)
    ("x"   "kill marked"     claude-dashboard-do-kill)]
   ["Dashboard"
-   ("N"   "new instance"    claude-dashboard-new)
-   ("c"   "continue (cwd)"  claude-dashboard-continue)
-   ("R"   "resume (picker)" claude-dashboard-resume)
-   ("g"   "refresh"         claude-dashboard-refresh)
-   ("q"   "quit window"     quit-window)])
+   ("N"   "new instance"        claude-dashboard-new)
+   ("b"   "new worktree+branch" claude-dashboard-new-worktree)
+   ("c"   "continue (cwd)"      claude-dashboard-continue)
+   ("R"   "resume (picker)"     claude-dashboard-resume)
+   ("g"   "refresh"             claude-dashboard-refresh)
+   ("q"   "quit window"         quit-window)])
 
 ;;; Mode
 
@@ -1350,11 +1700,17 @@ segment intact, elides intermediate components with `…/'."
     (define-key map "r"         #'claude-dashboard-restart)
     ;; Dashboard-level
     (define-key map "N"         #'claude-dashboard-new)
+    (define-key map "b"         #'claude-dashboard-new-worktree)
     (define-key map "c"         #'claude-dashboard-continue)
     (define-key map "R"         #'claude-dashboard-resume)
     (define-key map "g"         #'claude-dashboard-refresh)
     (define-key map "?"         #'claude-dashboard-menu)
     map))
+
+;; These run on every load (the defvar above only fires once).
+(define-key claude-dashboard-mode-map "w" #'claude-dashboard-copy-topic)
+(define-key claude-dashboard-mode-map "T" #'claude-dashboard-name-instance)
+(define-key claude-dashboard-mode-map "b" #'claude-dashboard-new-worktree)
 
 (define-derived-mode claude-dashboard-mode magit-section-mode "ClaudeDash"
   "Major mode for the Claude Code instance dashboard."
