@@ -17,15 +17,26 @@ Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-secti
 
 ```elisp
 (use-package claude-dashboard
-  :straight (:host github :repo "amunozgo/emacs_llm_dashboard"
+  :straight (:host github :repo "afermg/emacs-claude-dashboard"
              :files ("claude-dashboard.el"))
-  :commands (claude-dashboard claude-dashboard-new))
+  :commands (claude-dashboard claude-dashboard-new
+             claude-dashboard-continue claude-dashboard-resume))
+```
+
+With `package-vc-install` (Emacs 29+, no straight.el needed):
+
+```elisp
+(unless (package-installed-p 'claude-dashboard)
+  (package-vc-install
+   '(claude-dashboard
+     :url "https://github.com/afermg/emacs-claude-dashboard")))
+(require 'claude-dashboard)
 ```
 
 Or load manually:
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs_llm_dashboard")
+(add-to-list 'load-path "/path/to/emacs-claude-dashboard")
 (require 'claude-dashboard)
 ```
 
@@ -36,10 +47,13 @@ Or load manually:
 | Key   | Action                                 |
 | ----- | -------------------------------------- |
 | `n`   | new Claude instance (prompts for cwd)  |
+| `c`   | `claude --continue` in chosen cwd      |
+| `R`   | resume picker (all past sessions); on a row, defaults to that cwd |
 | `RET` / `o` | pop to instance buffer            |
 | `O`   | display instance buffer in other window |
 | `d`   | dired in instance cwd                  |
 | `m`   | magit-status on instance cwd           |
+| `s`   | open the instance's STATUS.md          |
 | `k`   | quit Claude gracefully (SIGINT)        |
 | `K`   | kill the eat buffer outright           |
 | `r`   | restart Claude in same buffer/cwd      |
@@ -53,8 +67,19 @@ then directories from `recentf-list`, then a free-form `read-directory-name`.
 ## Behavior notes
 
 - Status glyphs: ● running, ◐ idle (>60s no terminal output), ○ exited.
+- Each eat buffer is named `*claude-<project>-<sid8>*`. The session id
+  isn't known until Claude has written its session metadata (~2s after
+  launch), so the buffer is initially named `*claude-<project>-pending*`
+  and renamed once enrichment completes.
 - The eat buffer is kept alive after Claude exits so you can scroll back
   and `r` to restart. `K` removes it.
+- A `STATUS.md` file is created in each instance's cwd on launch (with a
+  starter template). The dashboard's `STATUS` column shows how long ago
+  it was last modified. Press `s` to visit. Claude **does not** write to
+  this file automatically — to make it useful, ask Claude in your first
+  prompt to keep `STATUS.md` updated, e.g. _"Update STATUS.md after each
+  significant step with what you did and what's next."_  Disable entirely
+  by `(setq claude-dashboard-status-file nil)`.
 - `~/.claude/sessions/<pid>.json` is read ~2s after launch to fill in the
   session id. The model is read from the latest JSONL in
   `~/.claude/projects/<encoded-cwd>/` once Claude has produced an assistant
