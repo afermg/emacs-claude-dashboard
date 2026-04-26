@@ -189,22 +189,16 @@ turn-threshold wait).")
 
 (defun claude-dashboard--count-user-turns (cwd sid)
   "Return the number of `type:user' entries in SID's transcript, or 0."
-  (or (and cwd sid
-           (let* ((proj-dir (expand-file-name
-                             (format "projects/%s"
-                                     (claude-dashboard--encode-cwd cwd))
-                             claude-dashboard-claude-dir))
-                  (file (expand-file-name (concat sid ".jsonl") proj-dir)))
-             (when (file-readable-p file)
-               (with-temp-buffer
-                 (insert-file-contents file)
-                 (goto-char (point-min))
-                 (let ((n 0))
-                   (while (not (eobp))
-                     (when (looking-at "{[^\n]*\"type\":\"user\"")
-                       (setq n (1+ n)))
-                     (forward-line 1))
-                   n)))))
+  (or (when-let ((file (claude-dashboard--transcript-file-for-sid sid cwd)))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (let ((n 0))
+            (while (not (eobp))
+              (when (looking-at "{[^\n]*\"type\":\"user\"")
+                (setq n (1+ n)))
+              (forward-line 1))
+            n)))
       0))
 
 (defun claude-dashboard--kebab-from-prompt (prompt)
@@ -1233,119 +1227,130 @@ covered separately by `claude-dashboard--first-prompt-from-transcript'."
               (forward-line 1))
             nil))))))
 
+(defun claude-dashboard--transcript-file-for-sid (sid &optional _cwd)
+  "Locate the most-recently-modified jsonl transcript for SID.
+Claude Code can write the same sessionId into different project
+dirs when the agent's cwd changes mid-session (e.g. user cd's into
+a worktree, or `/resume's an old session), so we always scan every
+subdir of `~/.claude/projects/' and pick the freshest file.  This
+gives the live customTitle / first-prompt for the agent's *current*
+state rather than its cwd-at-launch.
+The optional CWD argument is accepted for caller convenience but
+ignored — `mtime' is the authoritative tiebreaker."
+  (when sid
+    (let* ((target (concat sid ".jsonl"))
+           (projects-dir (expand-file-name "projects"
+                                           claude-dashboard-claude-dir))
+           candidates)
+      (when (file-directory-p projects-dir)
+        (dolist (sub (directory-files projects-dir t "^[^.]"))
+          (let ((c (expand-file-name target sub)))
+            (when (file-readable-p c)
+              (push c candidates))))
+        (when candidates
+          (car (sort candidates
+                     (lambda (a b)
+                       (time-less-p
+                        (file-attribute-modification-time
+                         (file-attributes b))
+                        (file-attribute-modification-time
+                         (file-attributes a)))))))))))
+
 (defun claude-dashboard--session-name-from-transcript (cwd sid)
   "Return the latest custom title for SID, or nil when none has been set.
-Reads `~/.claude/projects/<slug>/<SID>.jsonl' looking for the most
+Walks the per-session transcript bottom-up looking for the most
 recent `{\"type\":\"custom-title\", \"customTitle\": \"…\"}' entry.
 Claude Code's `/name <name>' slash command writes such a line, so
-when the user has named the conversation we report that name as the
-TOPIC."
-  (when (and cwd sid)
-    (let* ((proj-dir (expand-file-name
-                      (format "projects/%s"
-                              (claude-dashboard--encode-cwd cwd))
-                      claude-dashboard-claude-dir))
-           (file (expand-file-name (concat sid ".jsonl") proj-dir)))
-      (when (file-readable-p file)
-        (with-temp-buffer
-          (insert-file-contents file)
-          (goto-char (point-max))
-          (catch 'found
-            (while (not (bobp))
-              (forward-line -1)
-              (when (looking-at "{")
-                (let ((parsed (ignore-errors
-                                (json-parse-buffer
-                                 :object-type 'alist
-                                 :array-type 'list
-                                 :null-object nil
-                                 :false-object nil))))
-                  (goto-char (line-beginning-position))
-                  (when (and parsed
-                             (equal "custom-title"
-                                    (alist-get 'type parsed)))
-                    (let ((ct (alist-get 'customTitle parsed)))
-                      (when (and ct (not (string-empty-p ct)))
-                        (throw 'found ct)))))))
-            nil))))))
+when the user has named the conversation we report that name as
+the TOPIC.  CWD is a hint for the fast path; the finder falls back
+to scanning every project subdir if the cwd-encoded path misses."
+  (when-let ((file (claude-dashboard--transcript-file-for-sid sid cwd)))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-max))
+      (catch 'found
+        (while (not (bobp))
+          (forward-line -1)
+          (when (looking-at "{")
+            (let ((parsed (ignore-errors
+                            (json-parse-buffer
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil
+                             :false-object nil))))
+              (goto-char (line-beginning-position))
+              (when (and parsed
+                         (equal "custom-title"
+                                (alist-get 'type parsed)))
+                (let ((ct (alist-get 'customTitle parsed)))
+                  (when (and ct (not (string-empty-p ct)))
+                    (throw 'found ct)))))))
+        nil))))
 
 (defun claude-dashboard--session-slug-from-transcript (cwd sid)
   "Return Claude's auto-assigned slug for SID, or nil.
 The CLI tags every session with a kebab-case `slug' (e.g.
-`starry-mapping-cake') in transcript entries.  Less informative than
-a custom title or the first prompt, but better than `—'."
-  (when (and cwd sid)
-    (let* ((proj-dir (expand-file-name
-                      (format "projects/%s"
-                              (claude-dashboard--encode-cwd cwd))
-                      claude-dashboard-claude-dir))
-           (file (expand-file-name (concat sid ".jsonl") proj-dir)))
-      (when (file-readable-p file)
-        (with-temp-buffer
-          (insert-file-contents file nil 0 65536)
-          (goto-char (point-min))
-          (catch 'found
-            (while (not (eobp))
-              (when (looking-at "{")
-                (let ((parsed (ignore-errors
-                                (json-parse-buffer
-                                 :object-type 'alist
-                                 :array-type 'list
-                                 :null-object nil
-                                 :false-object nil))))
-                  (goto-char (line-beginning-position))
-                  (when parsed
-                    (let ((slug (alist-get 'slug parsed)))
-                      (when (and slug (not (string-empty-p slug)))
-                        (throw 'found slug))))))
-              (forward-line 1))
-            nil))))))
+`starry-mapping-cake') in transcript entries.  Less informative
+than a custom title or the first prompt, but better than `—'."
+  (when-let ((file (claude-dashboard--transcript-file-for-sid sid cwd)))
+    (with-temp-buffer
+      (insert-file-contents file nil 0 65536)
+      (goto-char (point-min))
+      (catch 'found
+        (while (not (eobp))
+          (when (looking-at "{")
+            (let ((parsed (ignore-errors
+                            (json-parse-buffer
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil
+                             :false-object nil))))
+              (goto-char (line-beginning-position))
+              (when parsed
+                (let ((slug (alist-get 'slug parsed)))
+                  (when (and slug (not (string-empty-p slug)))
+                    (throw 'found slug))))))
+          (forward-line 1))
+        nil))))
 
 (defun claude-dashboard--first-prompt-from-transcript (cwd sid)
   "Return the first user prompt from the per-session transcript file.
-Reads `~/.claude/projects/<slug>/<SID>.jsonl' and pulls the first
-entry of type `user' whose content text is human-typed prose (not a
-tool result, not an angle-bracket synthetic message).  This covers
-agents resumed from earlier conversations whose original first
-message never went through `history.jsonl'."
-  (when (and cwd sid)
-    (let* ((proj-dir (expand-file-name
-                      (format "projects/%s"
-                              (claude-dashboard--encode-cwd cwd))
-                      claude-dashboard-claude-dir))
-           (file (expand-file-name (concat sid ".jsonl") proj-dir)))
-      (when (file-readable-p file)
-        (with-temp-buffer
-          (insert-file-contents file nil 0 131072)
-          (goto-char (point-min))
-          (catch 'found
-            (while (not (eobp))
-              (when (looking-at "{")
-                (let ((parsed (ignore-errors
-                                (json-parse-buffer
-                                 :object-type 'alist
-                                 :array-type 'list
-                                 :null-object nil
-                                 :false-object nil))))
-                  (goto-char (line-beginning-position))
-                  (when (and parsed
-                             (equal "user" (alist-get 'type parsed)))
-                    (let* ((msg (alist-get 'message parsed))
-                           (content (and msg (alist-get 'content msg))))
-                      (cond
-                       ((and (stringp content)
-                             (not (string-prefix-p "<" content)))
-                        (throw 'found content))
-                       ((listp content)
-                        (dolist (c content)
-                          (let ((ctype (alist-get 'type c))
-                                (text (alist-get 'text c)))
-                            (when (and (equal "text" ctype)
-                                       (stringp text)
-                                       (not (string-prefix-p "<" text)))
-                              (throw 'found text))))))))))
-              (forward-line 1))
-            nil))))))
+Pulls the first `type:user' entry whose content text is human-typed
+prose (not a tool result, not an angle-bracket synthetic message).
+Covers agents resumed from earlier conversations whose original
+first message never went through `history.jsonl'."
+  (when-let ((file (claude-dashboard--transcript-file-for-sid sid cwd)))
+    (with-temp-buffer
+      (insert-file-contents file nil 0 131072)
+      (goto-char (point-min))
+      (catch 'found
+        (while (not (eobp))
+          (when (looking-at "{")
+            (let ((parsed (ignore-errors
+                            (json-parse-buffer
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil
+                             :false-object nil))))
+              (goto-char (line-beginning-position))
+              (when (and parsed
+                         (equal "user" (alist-get 'type parsed)))
+                (let* ((msg (alist-get 'message parsed))
+                       (content (and msg (alist-get 'content msg))))
+                  (cond
+                   ((and (stringp content)
+                         (not (string-prefix-p "<" content)))
+                    (throw 'found content))
+                   ((listp content)
+                    (dolist (c content)
+                      (let ((ctype (alist-get 'type c))
+                            (text (alist-get 'text c)))
+                        (when (and (equal "text" ctype)
+                                   (stringp text)
+                                   (not (string-prefix-p "<" text)))
+                          (throw 'found text))))))))))
+          (forward-line 1))
+        nil))))
 
 (defun claude-dashboard--live-session-id (inst)
   "Return the *current* session-id for INST via the running PID, or nil.
@@ -1357,6 +1362,19 @@ id has no on-disk transcript."
               (pid (and proc (process-id proc)))
               (json (claude-dashboard--read-session-json pid)))
     (alist-get 'sessionId json)))
+
+(defun claude-dashboard--live-session-name (inst)
+  "Return the *current* conversation name for INST, or nil.
+Reads `~/.claude/sessions/<PID>.json' and returns its `name' field.
+This file is updated in real-time by the Claude CLI on `/rename'
+\(and `/name'), so it is the authoritative current value even when
+the per-session transcript jsonl files have older customTitle
+entries from earlier renames."
+  (when-let* ((proc (claude-dashboard--instance-process inst))
+              (pid (and proc (process-id proc)))
+              (json (claude-dashboard--read-session-json pid))
+              (name (alist-get 'name json)))
+    (and (stringp name) (not (string-empty-p name)) name)))
 
 (defun claude-dashboard--latest-transcript-prompt (cwd)
   "First user message from the most recent transcript file under CWD's slug.
@@ -1392,6 +1410,10 @@ auto-generated slug → \"—\"."
              (val (or
                    ;; HIGHEST PRIORITY: a name set inside Claude via
                    ;; `/name <foo>' wins over every other candidate.
+                   ;; The live PID-json `name' field is updated
+                   ;; immediately on rename, so prefer it over the
+                   ;; transcript event log which can lag.
+                   (claude-dashboard--live-session-name inst)
                    (claude-dashboard--session-name-from-transcript
                     cwd live-sid)
                    (claude-dashboard--session-name-from-transcript
