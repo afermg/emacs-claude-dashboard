@@ -106,3 +106,10 @@ then directories from `recentf-list`, then a free-form `read-directory-name`.
       claude-dashboard-refresh-interval 5
       claude-dashboard-cache-ttl 30)
 ```
+
+## TODO
+
+- Keep a copy of the status of any given notebook the agent is working
+  on, and instruct Claude to keep it up-to-date — so the dashboard can
+  give an at-a-glance overview of every running session without having
+  to dive into each eat buffer.
