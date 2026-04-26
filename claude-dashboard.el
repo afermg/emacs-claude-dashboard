@@ -1442,10 +1442,14 @@ auto-generated slug → \"—\"."
         (puthash buf (cons val now) claude-dashboard--topic-cache)
         val))))
 
-(defun claude-dashboard--row-format (branch-w topic-w)
-  "Return the row format with dynamic BRANCH-W and TOPIC-W widths."
-  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%5s  %%-%ds"
-          claude-dashboard-project-max-width branch-w topic-w))
+(defun claude-dashboard--row-format (branch-w _topic-w)
+  "Return the row format with dynamic BRANCH-W width.
+TOPIC is the trailing column and is rendered with `%s' so short
+topics don't pad with trailing spaces — that padding could push
+the visible row past the window's right edge and wrap to a
+second line on narrower windows."
+  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%5s  %%s"
+          claude-dashboard-project-max-width branch-w))
 
 (defun claude-dashboard--instance-deploy-branch (inst)
   "Return the branch INST was deployed against, falling back to live."
@@ -1571,7 +1575,12 @@ segment intact, elides intermediate components with `…/'."
                   (- (float-time)
                      (claude-dashboard-instance-started-at inst))))
          (branch (claude-dashboard--instance-deploy-branch inst))
-         (topic (claude-dashboard--instance-topic inst))
+         ;; Collapse any internal newlines / runs of whitespace so the
+         ;; row never spans multiple lines even if the source string
+         ;; (e.g. a STATUS.md heading or first prompt) had a newline.
+         (topic (replace-regexp-in-string
+                 "[\t\n\r ]+" " "
+                 (or (claude-dashboard--instance-topic inst) "")))
          (sid (or (and (claude-dashboard-instance-session-id inst)
                        (substring
                         (claude-dashboard-instance-session-id inst) 0 8))
@@ -1591,7 +1600,9 @@ segment intact, elides intermediate components with `…/'."
             (truncate-string-to-width branch branch-w nil ?\s "…")
             sid
             (claude-dashboard--status-snippet cwd)
-            (truncate-string-to-width topic topic-w nil ?\s "…"))))
+            ;; No padding char — keep the row's printed length equal
+            ;; to its actual content so it never overflows the window.
+            (truncate-string-to-width topic topic-w nil nil "…"))))
 
 (defun claude-dashboard--insert-instance-section (inst branch-w topic-w)
   (magit-insert-section (claude-dashboard-instance-section inst)
