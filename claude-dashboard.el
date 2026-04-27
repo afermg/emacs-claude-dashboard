@@ -146,19 +146,23 @@ mark and the bare prompt cursor may be separated by the bordered input
 box plus footer lines."
   :type 'integer :group 'claude-dashboard)
 
-(defcustom claude-dashboard-question-max-line-distance 30
-  "Max lines between the trailing question mark and the bare prompt cursor.
-Bounds how far back `claude-dashboard--free-text-prompt-p' will look so
-a stray earlier `?' does not keep a row stuck on the awaiting glyph."
-  :type 'integer :group 'claude-dashboard)
-
 (defun claude-dashboard--free-text-prompt-p (inst)
   "Return non-nil when INST is awaiting a free-text reply.
 Catches plain-prose questions like `OK to publish, or stop at draft?'
 that the menu-only `claude-dashboard--awaiting-input-p' misses.
-Heuristic: the buffer tail contains a bare `\\=`❯' prompt cursor (no
-menu option attached) AND the closest preceding non-blank line, within
-`claude-dashboard-question-max-line-distance' lines, ends with `?'."
+
+Heuristic, in order:
+
+1. The buffer tail contains a bare `\\=`❯' prompt cursor — `❯' followed
+   only by whitespace (including non-breaking space) on its own line.
+2. The closest line above that cursor ending in sentence-final
+   punctuation (`.', `!', or `?') ends in `?'.
+
+Step 2 is the strict guard: if the most recent sentence Claude wrote
+ended in a period or exclamation it was a statement, not a question, so
+we stay out of awaiting state.  This rules out the previous lenient
+\"any `?' within N lines\" rule, which fired on stale `?' from earlier
+turns and on `?' embedded in code samples or quoted output."
   (when-let* ((buf (claude-dashboard-instance-buffer inst))
               ((buffer-live-p buf)))
     (with-current-buffer buf
@@ -167,16 +171,14 @@ menu option attached) AND the closest preceding non-blank line, within
                                (- (point-max)
                                   claude-dashboard-question-tail-chars))))
           (goto-char (point-max))
-          ;; Use [[:space:]] (not [ \t]) so the bare cursor line still
-          ;; matches when Claude Code pads it with a non-breaking space.
           (when (re-search-backward "^❯[[:space:]]*$" tail-start t)
-            (let ((cursor-line (line-number-at-pos))
-                  (cursor-bol (line-beginning-position)))
+            (let ((cursor-bol (line-beginning-position)))
               (save-excursion
                 (goto-char cursor-bol)
-                (and (re-search-backward "\\?[[:space:]]*$" tail-start t)
-                     (<= (- cursor-line (line-number-at-pos))
-                         claude-dashboard-question-max-line-distance))))))))))
+                (when (re-search-backward "[.!?][[:space:]]*$"
+                                          tail-start t)
+                  ;; The matched char is at (1- (match-end 0)).
+                  (eq (char-after (1- (match-end 0))) ??))))))))))
 
 (defcustom claude-dashboard-monitoring-regexp
   "[0-9]+m[ \t]+[0-9]+s[^\n]*esc to interrupt"
@@ -1129,6 +1131,12 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
          (buf (get-buffer-create name))
          (args (append claude-dashboard-program-args extra-args)))
     (with-current-buffer buf
+      ;; Eat's shell-prompt annotation reserves a one-column left margin.
+      ;; Claude Code is a TUI app, not a shell — the column shifts the
+      ;; whole frame right and clips the right edge of the boxed prompt,
+      ;; producing an apparent extra wrap line.  Disable it before
+      ;; `eat-mode' runs so the margin isn't installed in this buffer.
+      (setq-local eat-enable-shell-prompt-annotation nil)
       (unless (derived-mode-p 'eat-mode)
         (eat-mode))
       (eat-exec buf name claude-dashboard-program nil args))
