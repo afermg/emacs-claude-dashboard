@@ -1543,11 +1543,40 @@ segment intact, elides intermediate components with `…/'."
             ;; to its actual content so it never overflows the window.
             (truncate-string-to-width topic topic-w nil nil "…"))))
 
+(defun claude-dashboard--insert-instance-overview (inst)
+  "Insert the per-instance overview body (visible when section unfolds).
+Currently shows the contents of the instance's STATUS.md indented
+under the heading, or a `(no STATUS.md)' placeholder."
+  (let* ((cwd (claude-dashboard-instance-cwd inst))
+         (path (claude-dashboard--status-path cwd))
+         (text (and path (file-readable-p path)
+                    (with-temp-buffer
+                      (insert-file-contents path)
+                      (string-trim-right (buffer-string))))))
+    (if (and text (not (string-empty-p text)))
+        (insert (propertize
+                 (replace-regexp-in-string "^" "    " text)
+                 'face 'font-lock-comment-face)
+                "\n")
+      (insert "    "
+              (propertize "(no STATUS.md)" 'face 'shadow)
+              "\n"))))
+
 (defun claude-dashboard--insert-instance-section (inst branch-w topic-w)
-  (magit-insert-section (claude-dashboard-instance-section inst)
-    (insert (claude-dashboard--format-instance-line
-             inst branch-w topic-w))
-    (insert "\n")))
+  ;; Each instance row is the heading of a magit section whose body
+  ;; is the per-instance overview.  TAB (inherited from
+  ;; `magit-section-mode-map' as `magit-section-toggle') expands or
+  ;; collapses individual rows; `magit-section-cache-visibility' set
+  ;; in the mode init preserves state across the 5-second refresh.
+  (let ((section
+         (magit-insert-section (claude-dashboard-instance-section inst t)
+           (magit-insert-heading
+             (claude-dashboard--format-instance-line inst branch-w topic-w))
+           (claude-dashboard--insert-instance-overview inst))))
+    ;; The HIDE arg sets the slot but doesn't apply the invisibility
+    ;; overlay; do that explicitly so the body actually starts folded.
+    (when (and section (oref section hidden))
+      (magit-section-hide section))))
 
 (defun claude-dashboard--render ()
   "Replace the current buffer's contents with a fresh dashboard."
@@ -1691,6 +1720,17 @@ segment intact, elides intermediate components with `…/'."
   (setq buffer-read-only t)
   (setq-local font-lock-defaults nil)
   (font-lock-mode -1)
+  ;; Each instance row is the heading of a magit section whose body
+  ;; is the per-instance overview (STATUS.md content).  Default-hide
+  ;; the bodies; TAB (inherited from `magit-section-mode-map' as
+  ;; `magit-section-toggle') expands them.
+  (setq-local magit-section-initial-visibility-alist
+              '((claude-dashboard-instance-section . hide)))
+  ;; Cache fold state across the 5-second auto-refresh so expanded
+  ;; rows don't snap shut on every render.  magit-section keys cached
+  ;; visibility on the section's value (the instance struct is stable
+  ;; across renders).
+  (setq-local magit-section-cache-visibility t)
   (unless claude-dashboard--refresh-timer
     (setq claude-dashboard--refresh-timer
           (run-with-timer claude-dashboard-refresh-interval
