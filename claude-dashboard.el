@@ -409,23 +409,47 @@ tool call whose body matches `claude-dashboard-monitoring-keywords-regexp'."
                (string-match-p
                 claude-dashboard-monitoring-keywords-regexp cmd)))))))))
 
+(defcustom claude-dashboard-running-regexp "esc to interrupt"
+  "Regexp for an active Claude Code spinner of any duration.
+A match in the eat buffer's tail means Claude is currently
+generating tokens or running a tool.  Absence (and no monitoring /
+awaiting signal) means the agent is idle, regardless of how
+recently bytes were last written to the buffer — that way focusing
+the eat buffer (which causes cosmetic redraws) doesn't flip the
+row to RUN."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-running-tail-chars 300
+  "Trailing eat-buffer chars to scan for the active spinner."
+  :type 'integer :group 'claude-dashboard)
+
+(defun claude-dashboard--running-p (inst)
+  "Return non-nil when INST has an active Claude Code spinner in its tail."
+  (when-let* ((buf (claude-dashboard-instance-buffer inst))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (point-max))
+        (let ((tail-start (max (point-min)
+                               (- (point-max)
+                                  claude-dashboard-running-tail-chars))))
+          (re-search-backward claude-dashboard-running-regexp
+                              tail-start t))))))
+
 (defun claude-dashboard--status (inst)
   "Return a symbol summarizing INST's current state.
-One of `running' (Claude is actively producing output),
+One of `running' (active spinner in the eat buffer tail),
 `awaiting' (Claude is showing a menu of options for the user to pick),
-`monitoring' (Claude is waiting on a long-running external tool),
-`idle' (process alive but quiet for a while, no pending menu),
+`monitoring' (long-running tool / sleeping / polling intent),
+`idle' (process alive, no spinner, no menu),
 or `exited' (process is gone)."
   (let ((proc (claude-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
      ((claude-dashboard--awaiting-input-p inst) 'awaiting)
      ((claude-dashboard--monitoring-p inst) 'monitoring)
-     ((let ((last (claude-dashboard-instance-last-output inst)))
-        (and last (> (- (float-time) last)
-                     claude-dashboard-idle-threshold)))
-      'idle)
-     (t 'running))))
+     ((claude-dashboard--running-p inst) 'running)
+     (t 'idle))))
 
 (defun claude-dashboard--state-color (status)
   (pcase status
