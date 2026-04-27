@@ -9,6 +9,10 @@ keys to jump in, restart, or kill.
 It only tracks instances **launched through it** — Claude processes started
 elsewhere (in a regular terminal, in another Emacs) do not appear.
 
+Per-row info: project tag, state (RUN/MON/ASK/IDL/EXT), uptime, deploy
+branch, session id, todos remaining and age, and conversation name.
+TAB unfolds a row to show the agent's current TodoWrite snapshot.
+
 ## Install
 
 Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-section.html),
@@ -56,7 +60,6 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `O`   | display instance buffer in other window |
 | `d`   | dired in instance cwd                  |
 | `v`   | magit-status on instance cwd           |
-| `s`   | open the instance's STATUS.md          |
 | `m` / `u` | mark / unmark current row          |
 | `t` / `U` | toggle all marks / unmark all      |
 | `D`   | quit (graceful) marked, or current     |
@@ -74,28 +77,27 @@ then directories from `recentf-list`, then a free-form `read-directory-name`.
 
 ## Behavior notes
 
-- Status glyphs: ● running, ◐ idle (>60s no terminal output), ○ exited.
+- Status glyphs: ● running (active spinner), ↻ monitoring (long bash /
+  sleeping), ? awaiting (menu of options visible), ◐ idle, ○ exited.
 - Each eat buffer is named `*claude-<project>-<sid8>*`. The session id
   isn't known until Claude has written its session metadata (~2s after
   launch), so the buffer is initially named `*claude-<project>-pending*`
   and renamed once enrichment completes.
 - The eat buffer is kept alive after Claude exits so you can scroll back
   and `r` to restart. `K` removes it.
-- A `STATUS.md` file is created in each instance's cwd on launch (with a
-  starter template). The dashboard's `STATUS` column shows how long ago
-  it was last modified. Press `s` to visit.
-- The launch automatically injects `--append-system-prompt` instructing
-  Claude to keep `STATUS.md` current after every meaningful step. Tune
-  the wording via `claude-dashboard-status-system-prompt`, or set it to
-  `nil` to skip the injection. Disable the whole feature with
-  `(setq claude-dashboard-status-file nil)`.
-- `~/.claude/sessions/<pid>.json` is read ~2s after launch to fill in the
-  session id. The model is read from the latest JSONL in
-  `~/.claude/projects/<encoded-cwd>/` once Claude has produced an assistant
-  turn — refresh with `g` if it shows `—`.
-- Last user prompt comes from the tail of `~/.claude/history.jsonl`,
-  matched against the instance's cwd. Cached for 30s.
-- A 5-second timer re-renders the dashboard whenever it's visible.
+- The `TODO` column shows `<remaining> <age>` for the agent's latest
+  `TodoWrite` snapshot — number of pending+in-progress items and the
+  age of the most recent update. `TAB` on a row unfolds the full todo
+  list as the per-instance overview. No file is written; everything is
+  read from the per-session transcript at
+  `~/.claude/projects/<slug>/<sid>.jsonl`.
+- The session name shown in `TOPIC` is taken first from the live
+  `~/.claude/sessions/<PID>.json` `name` field (updated on every
+  `/rename`), then transcript `customTitle` events, then the worktree
+  branch (if launched via `b`), then the first user prompt, then
+  Claude's auto-assigned slug.
+- A 5-second timer re-renders the dashboard whenever it's visible;
+  expensive lookups (branch, project name, topic) are cached for 30 s.
 
 ## Customization
 
@@ -107,9 +109,3 @@ then directories from `recentf-list`, then a free-form `read-directory-name`.
       claude-dashboard-cache-ttl 30)
 ```
 
-## TODO
-
-- Keep a copy of the status of any given notebook the agent is working
-  on, and instruct Claude to keep it up-to-date — so the dashboard can
-  give an at-a-glance overview of every running session without having
-  to dive into each eat buffer.

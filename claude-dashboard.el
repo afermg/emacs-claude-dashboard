@@ -706,16 +706,108 @@ Result is a plist (:name STR :input ALIST)."
      (alist-get 'description input))
     (_ nil)))
 
+(defun claude-dashboard--first-sentence (text)
+  "Return the first sentence of TEXT, with markdown markers stripped."
+  (when (and text (stringp text))
+    (let* ((trimmed (string-trim text))
+           ;; Take everything up to the first sentence boundary
+           ;; (period/!/? followed by space or end-of-line) or hard newline.
+           (first-line (car (split-string trimmed "\n" t)))
+           (first-sent (if (string-match
+                            "\\`\\(.*?[.!?]\\)\\(?:\\s-\\|\\'\\)"
+                            first-line)
+                           (match-string 1 first-line)
+                         first-line))
+           ;; Strip leading markdown markers (#, *, -, >, backticks).
+           (clean (replace-regexp-in-string
+                   "\\`[ \t#*>`-]+" "" first-sent)))
+      (and (> (length clean) 0) clean))))
+
 (defun claude-dashboard--activity-cell (cwd sid)
-  "Return `<tool> <hint>' for the agent's latest tool call, or `—'."
-  (if-let* ((tu (claude-dashboard--latest-tool-use cwd sid))
-            (name (plist-get tu :name)))
-      (let* ((hint (claude-dashboard--tool-hint name (plist-get tu :input)))
-             (combined (if (and hint (stringp hint) (> (length hint) 0))
-                           (format "%s %s" name hint)
-                         name)))
-        (replace-regexp-in-string "[\t\n\r]+" " " combined))
-    "—"))
+  "Return a short summary of the agent's most recent activity.
+Walks SID's transcript bottom-up and returns the first sentence of
+the latest assistant text content, OR a `<Tool> <hint>' summary
+when the very last assistant content item is a tool_use rather
+than prose.  Falls back to `—' when no assistant turn exists yet."
+  (or (claude-dashboard--map-jsonl-entries
+       (claude-dashboard--transcript-file-for-sid sid cwd)
+       (lambda (entry)
+         (when (equal "assistant" (alist-get 'type entry))
+           (let ((content (and (alist-get 'message entry)
+                               (alist-get 'content
+                                          (alist-get 'message entry)))))
+             (when (listp content)
+               (cl-some
+                (lambda (c)
+                  (let ((ctype (alist-get 'type c)))
+                    (cond
+                     ((equal "text" ctype)
+                      (claude-dashboard--first-sentence
+                       (alist-get 'text c)))
+                     ((equal "tool_use" ctype)
+                      (let* ((name (alist-get 'name c))
+                             (hint (claude-dashboard--tool-hint
+                                    name (alist-get 'input c))))
+                        (if (and hint (stringp hint)
+                                 (> (length hint) 0))
+                            (format "%s %s" name hint)
+                          name))))))
+                (reverse content))))))
+       t)
+      "—"))
+
+(defun claude-dashboard--all-exchanges (cwd sid)
+  "Return every (:user STR :asst STR :id STR) exchange in SID's transcript.
+Walked top-down so the result is chronological.  An exchange is
+opened on each non-meta `user' message whose content has visible
+text; subsequent assistant text content is appended to that
+exchange's :asst (multiple assistant turns between two user turns
+are concatenated with a blank line)."
+  (let (exchanges current)
+    (claude-dashboard--map-jsonl-entries
+     (claude-dashboard--transcript-file-for-sid sid cwd)
+     (lambda (entry)
+       (let ((type (alist-get 'type entry))
+             (msg (alist-get 'message entry))
+             (is-meta (alist-get 'isMeta entry))
+             (pid (alist-get 'promptId entry)))
+         (cond
+          ((and (equal "user" type) (not is-meta))
+           (let* ((content (and msg (alist-get 'content msg)))
+                  (txt (cond
+                        ((stringp content) content)
+                        ((listp content)
+                         (when-let ((it (cl-find-if
+                                         (lambda (c)
+                                           (equal "text"
+                                                  (alist-get 'type c)))
+                                         content)))
+                           (alist-get 'text it))))))
+             (when (and txt (stringp txt)
+                        (not (string-prefix-p "<" txt))
+                        (> (length (string-trim txt)) 0))
+               (when current (push current exchanges))
+               (setq current
+                     (list :user (string-trim txt)
+                           :asst nil
+                           :id (or pid (md5 txt)))))))
+          ((and (equal "assistant" type) current)
+           (let ((content (and msg (alist-get 'content msg))))
+             (when (listp content)
+               (dolist (c content)
+                 (when (equal "text" (alist-get 'type c))
+                   (let ((txt (alist-get 'text c)))
+                     (when (and txt (> (length (string-trim txt)) 0))
+                       (let ((prior (plist-get current :asst))
+                             (new (string-trim txt)))
+                         (setq current
+                               (plist-put current :asst
+                                          (if prior
+                                              (concat prior "\n\n" new)
+                                            new)))))))))))))
+       nil))
+    (when current (push current exchanges))
+    (nreverse exchanges)))
 
 (defun claude-dashboard--last-exchange (cwd sid)
   "Return (:user STR :asst STR) — the latest user query and assistant text.
@@ -1204,9 +1296,10 @@ With prefix arg or when called from a row, restrict to that row's cwd."
       (claude-dashboard--maybe-refresh))))
 
 (defun claude-dashboard-quit-instance (inst)
-  "Send a graceful quit to INST's claude process."
+  "Send a graceful quit to INST's claude process and kill its eat buffer."
   (interactive (list (claude-dashboard--current-instance)))
-  (let ((proc (claude-dashboard--instance-process inst)))
+  (let ((proc (claude-dashboard--instance-process inst))
+        (buf (claude-dashboard-instance-buffer inst)))
     (unless proc (user-error "No live process"))
     (interrupt-process proc)
     (run-at-time
@@ -1214,6 +1307,9 @@ With prefix arg or when called from a row, restrict to that row's cwd."
      (lambda ()
        (when (process-live-p proc)
          (delete-process proc))
+       (when (buffer-live-p buf)
+         (let ((kill-buffer-query-functions nil))
+           (kill-buffer buf)))
        (claude-dashboard--maybe-refresh)))))
 
 (defun claude-dashboard-kill-buffer (inst)
@@ -1255,6 +1351,7 @@ With prefix arg or when called from a row, restrict to that row's cwd."
 
 (defclass claude-dashboard-section (magit-section) ())
 (defclass claude-dashboard-instance-section (magit-section) ())
+(defclass claude-dashboard-query-section (magit-section) ())
 
 (defcustom claude-dashboard-project-max-width 14
   "Hard cap on the PROJECT column width."
@@ -1396,7 +1493,7 @@ TOPIC is the trailing column and is rendered with `%s' so short
 topics don't pad with trailing spaces — that padding could push
 the visible row past the window's right edge and wrap to a
 second line on narrower windows."
-  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-18s  %%s"
+  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-24s  %%s"
           claude-dashboard-project-max-width branch-w))
 
 (defun claude-dashboard--instance-deploy-branch (inst)
@@ -1530,7 +1627,7 @@ segment intact, elides intermediate components with `…/'."
          (sid (or (and sid-full (substring sid-full 0 8)) "—"))
          (activity-cell
           (truncate-string-to-width
-           (claude-dashboard--activity-cell cwd sid-full) 18 nil ?\s "…")))
+           (claude-dashboard--activity-cell cwd sid-full) 24 nil ?\s "…")))
     (format (claude-dashboard--row-format branch-w topic-w)
             (if (gethash (claude-dashboard-instance-buffer inst)
                          claude-dashboard--marks)
@@ -1562,37 +1659,54 @@ segment intact, elides intermediate components with `…/'."
                 flat claude-dashboard-exchange-text-width nil nil "…")))
     (insert prefix (propertize line 'face text-face) "\n")))
 
+(defun claude-dashboard--insert-query-section (xch)
+  "Insert a magit subsection for one exchange XCH (`:user :asst :id').
+The user prompt is the section heading (`❯ …'); the formatted
+assistant response is the section body, dimmed in `shadow' face.
+Sections start collapsed; press TAB on the heading or `3' globally
+to reveal responses."
+  (let* ((user-text (or (plist-get xch :user) ""))
+         (asst-text (or (plist-get xch :asst) ""))
+         (heading
+          (concat "    "
+                  (propertize "❯" 'face 'font-lock-keyword-face)
+                  " "
+                  (propertize
+                   (truncate-string-to-width
+                    (replace-regexp-in-string "[\t\n\r ]+" " " user-text)
+                    claude-dashboard-exchange-text-width nil nil "…")
+                   'face 'default)))
+         (section
+          (magit-insert-section (claude-dashboard-query-section
+                                 (plist-get xch :id) t)
+            (magit-insert-heading heading)
+            (when (> (length (string-trim asst-text)) 0)
+              (insert (propertize
+                       (replace-regexp-in-string
+                        "^" "      "
+                        (string-trim-right asst-text))
+                       'face 'shadow)
+                      "\n")))))
+    (when (and section (oref section hidden))
+      (magit-section-hide section))))
+
 (defun claude-dashboard--insert-instance-overview (inst)
-  "Insert the per-instance overview body (visible when section unfolds).
-Two lines: the user's most recent query prefixed with `❯ ' (so it
-visually anchors the exchange) and the latest assistant response
-indented underneath in `shadow' face — no glyph, since the row
-already has a status glyph at the same column and the duplicate
-was distracting."
+  "Insert the per-instance overview body (visible when row unfolds).
+Each user query becomes its own foldable subsection whose body is
+the formatted assistant response.  Combined with magit-section's
+`magit-section-show-level-N-all' bindings on `1'..`4', this gives
+three progressive views: rows-only (1), rows + queries (2), rows
++ queries + responses (3)."
   (let* ((cwd (claude-dashboard-instance-cwd inst))
          (sid (or (claude-dashboard--live-session-id inst)
                   (claude-dashboard-instance-session-id inst)))
-         (xch (claude-dashboard--last-exchange cwd sid))
-         (last-user (plist-get xch :user))
-         (last-asst (plist-get xch :asst)))
-    (cond
-     ((or last-user last-asst)
-      (when last-user
-        (claude-dashboard--render-body-line
-         (concat "    "
-                 (propertize "❯" 'face 'font-lock-keyword-face)
-                 " ")
-         'default last-user))
-      (when last-asst
-        ;; Six-space indent so the assistant text aligns under the
-        ;; user text (column 6, same as where text starts after
-        ;; "    ❯ "), with no glyph.  Shadow face dims it relative
-        ;; to the user query.
-        (claude-dashboard--render-body-line "      " 'shadow last-asst)))
-     (t
+         (exchanges (claude-dashboard--all-exchanges cwd sid)))
+    (if exchanges
+        (dolist (xch exchanges)
+          (claude-dashboard--insert-query-section xch))
       (insert "    "
               (propertize "(no exchange yet)" 'face 'shadow)
-              "\n")))))
+              "\n"))))
 
 (defun claude-dashboard--insert-instance-section (inst branch-w topic-w)
   ;; Each instance row is the heading of a magit section whose body
@@ -1624,9 +1738,9 @@ was distracting."
              (branch-w (claude-dashboard--column-width
                         "BRANCH" branches
                         claude-dashboard-branch-max-width))
-             ;; M G PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) ACT(18)  TOPIC
+             ;; M G PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) ACT(24)  TOPIC
              (prefix-w (+ 1 1 1 1 claude-dashboard-project-max-width
-                            1 3 1 5 1 branch-w 1 8 1 18 2))
+                            1 3 1 5 1 branch-w 1 8 1 24 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
              (topic-w (max 16 (- frame-w prefix-w))))
@@ -1754,7 +1868,8 @@ was distracting."
   ;; Default-hide the bodies; TAB (inherited from `magit-section-mode-map'
   ;; as `magit-section-toggle') expands them.
   (setq-local magit-section-initial-visibility-alist
-              '((claude-dashboard-instance-section . hide)))
+              '((claude-dashboard-instance-section . hide)
+                (claude-dashboard-query-section    . hide)))
   ;; Cache fold state across the 5-second auto-refresh so expanded
   ;; rows don't snap shut on every render.  magit-section keys cached
   ;; visibility on the section's value (the instance struct is stable
