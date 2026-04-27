@@ -100,98 +100,10 @@ against rather than what the worktree currently points at.")
   (when (buffer-live-p (claude-dashboard-instance-buffer inst))
     (get-buffer-process (claude-dashboard-instance-buffer inst))))
 
-(defcustom claude-dashboard-awaiting-regexp
-  "❯ +\\(?:[0-9]+\\.\\|Yes\\b\\|No\\b\\)"
-  "Regexp matched against the tail of the eat buffer.
-Designed to match the cursor on a Claude Code menu of options
-\(numbered options like \"❯ 1.\" or a Yes/No prompt arrow).  A match
-means the user has options to choose from, not just that Claude is
-quiet."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-awaiting-tail-chars 300
-  "Number of trailing eat-buffer chars to scan for a pending menu.
-A real Claude Code menu cursor + remaining option lines fits in a
-few hundred chars, so once Claude streams any new output after the
-menu the cursor falls out of this window and the row stops showing
-the awaiting glyph."
-  :type 'integer :group 'claude-dashboard)
-
-(defun claude-dashboard--awaiting-input-p (inst)
-  "Return non-nil when INST is presenting a menu of options to the user.
-Looks only at the last `claude-dashboard-awaiting-tail-chars' of the
-eat buffer.  Requires the menu-cursor regexp AND a sibling option
-\(another numbered line or Yes/No token) appearing strictly after the
-cursor, anchoring the match to the visible bottom of the terminal."
-  (when-let* ((buf (claude-dashboard-instance-buffer inst))
-              ((buffer-live-p buf)))
-    (with-current-buffer buf
-      (save-excursion
-        (goto-char (point-max))
-        (let ((tail-start (max (point-min)
-                               (- (point-max)
-                                  claude-dashboard-awaiting-tail-chars))))
-          (when (re-search-backward claude-dashboard-awaiting-regexp
-                                    tail-start t)
-            (let ((cursor-end (match-end 0)))
-              (save-excursion
-                (goto-char cursor-end)
-                (re-search-forward "^\\s-*[0-9]+\\.\\|\\bNo\\b\\|\\bYes\\b"
-                                   (point-max) t)))))))))
-
-(defcustom claude-dashboard-question-tail-chars 1500
-  "Trailing eat-buffer chars scanned for a free-text question.
-Larger than `claude-dashboard-awaiting-tail-chars' because the question
-mark and the bare prompt cursor may be separated by the bordered input
-box plus footer lines."
-  :type 'integer :group 'claude-dashboard)
-
-(defun claude-dashboard--free-text-prompt-p (inst)
-  "Return non-nil when INST is awaiting a free-text reply.
-Catches plain-prose questions like `OK to publish, or stop at draft?'
-that the menu-only `claude-dashboard--awaiting-input-p' misses.
-
-Heuristic, in order:
-
-1. The buffer tail contains a bare `\\=`❯' prompt cursor — `❯' followed
-   only by whitespace (including non-breaking space) on its own line.
-2. The closest line above that cursor ending in sentence-final
-   punctuation (`.', `!', or `?') ends in `?'.
-
-Step 2 is the strict guard: if the most recent sentence Claude wrote
-ended in a period or exclamation it was a statement, not a question, so
-we stay out of awaiting state.  This rules out the previous lenient
-\"any `?' within N lines\" rule, which fired on stale `?' from earlier
-turns and on `?' embedded in code samples or quoted output."
-  (when-let* ((buf (claude-dashboard-instance-buffer inst))
-              ((buffer-live-p buf)))
-    (with-current-buffer buf
-      (save-excursion
-        (let ((tail-start (max (point-min)
-                               (- (point-max)
-                                  claude-dashboard-question-tail-chars))))
-          (goto-char (point-max))
-          (when (re-search-backward "^❯[[:space:]]*$" tail-start t)
-            (let ((cursor-bol (line-beginning-position)))
-              (save-excursion
-                (goto-char cursor-bol)
-                (when (re-search-backward "[.!?][[:space:]]*$"
-                                          tail-start t)
-                  ;; The matched char is at (1- (match-end 0)).
-                  (eq (char-after (1- (match-end 0))) ??))))))))))
-
-(defcustom claude-dashboard-monitoring-regexp
-  "[0-9]+m[ \t]+[0-9]+s[^\n]*esc to interrupt"
-  "Regexp for a *live* monitoring spinner in the eat buffer tail.
-Matches a Claude Code progress spinner whose elapsed time has
-crossed one minute (e.g. `1m 30s · ↑ 2k tokens · esc to interrupt')."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-monitoring-tail-chars 400
-  "Trailing eat-buffer chars to scan for a live monitoring spinner.
-Tight enough that once the tool finishes and Claude streams a few
-hundred chars of new output, the spinner falls out of the window."
-  :type 'integer :group 'claude-dashboard)
+;;; --- Phase classification (stub) ----------------------------------------
+;; Real definitions live below `claude-dashboard-name-instance' so they sit
+;; alongside the other classifier customs.  This top-of-file stub block was
+;; replaced wholesale; see the "Phases" section further down.
 
 (defcustom claude-dashboard-auto-name-after-turns 5
   "Send `/name <topic>' once an instance reaches this many user turns.
@@ -359,123 +271,174 @@ user prompt).  Useful when you want to override or backfill."
     (message "Sent /name %s to %s" name
              (buffer-name (claude-dashboard-instance-buffer inst)))))
 
-(defcustom claude-dashboard-monitoring-keywords-regexp
+;;; --- Phase classification ------------------------------------------------
+;;
+;; A Claude Code instance moves through five phases at runtime:
+;;
+;;   `exited'     OS process is gone.
+;;   `running'    Spinner visible in the buffer tail — Claude is
+;;                actively producing output or running a tool call.
+;;   `monitoring' Variant of `running': the live tool call is a
+;;                polling / sleep / watch command, OR Claude
+;;                announced a deliberate wait such as
+;;                `● Sleeping while nb03 exports.'.
+;;   `awaiting'   No spinner; bordered prompt box visible at bottom;
+;;                either a menu option is attached to the cursor, or
+;;                the last sentence Claude wrote ended with `?'.
+;;   `idle'       Default fallback — process alive, no spinner, no
+;;                pending question.
+;;
+;; All five are decided by a single classifier `claude-dashboard--classify'
+;; which reads the last `claude-dashboard-tail-chars' of the eat buffer
+;; once per call.  The entry point `claude-dashboard--status' is a thin
+;; wrapper preserved so existing callers (auto-name, header rendering,
+;; status-rank) keep working unchanged.
+
+(defcustom claude-dashboard-tail-chars 2000
+  "Trailing eat-buffer chars used by `claude-dashboard--classify'.
+Wide enough to span a multi-option menu plus its framing borders, the
+gap between a spinner and its triggering Bash tool call, and the two
+or three short sentences a question typically sits in."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-spinner-regexp "esc to interrupt"
+  "Regexp marking Claude Code's live progress spinner.
+Match anywhere in the tail means the agent is actively working
+(generating tokens or running a tool).  Absence — combined with no
+explicit waiting intent — drops the row out of the `running' family
+into `awaiting' or `idle' depending on the prompt cursor."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitoring-cmd-regexp
   (concat "\\(?:"
-          "pgrep\\|pidof\\|\\bps \\b\\|ps -\\b\\|ps a\\b"
-          "\\|tail -[fnFN]"
+          "pgrep\\|pidof\\|\\bps\\b\\|tail -[fnFN]"
           "\\|screen -ls\\|tmux ls\\|watch \\b"
           "\\|journalctl\\|systemctl status"
           "\\|nvidia-smi\\|rocm-smi\\|htop\\|top -b"
           "\\|kubectl get\\|kubectl logs\\|docker ps\\|docker logs"
           "\\|\\bsleep [0-9]\\|ping \\b"
           "\\)")
-  "Regexp of shell verbs that read process / log / cluster state.
-Used to classify the agent's *most recent* Bash tool call as
-monitoring vs. one-shot work."
+  "Regexp of shell verbs that indicate a polling / monitoring tool call.
+Matched against the body of the most recent `Bash(...)' tool call when
+deciding whether a `running' instance is really `monitoring'."
   :type 'regexp :group 'claude-dashboard)
 
 (defcustom claude-dashboard-monitoring-intent-regexp
-  "^●\\s-+\\(?:Sleeping\\|Waiting\\|Polling\\|Monitoring\\|Watching\\)\\b"
-  "Regexp matching an assistant message declaring monitoring intent.
-A message like `● Sleeping while nb03 exports.' means the agent is
-deliberately waiting on an external process even though no spinner
-or tool call is currently active."
+  "^●[[:space:]]+\\(?:Sleeping\\|Waiting\\|Polling\\|Monitoring\\|Watching\\)\\b"
+  "Regexp marking an assistant message that declares a deliberate wait.
+Triggers `monitoring' even when no spinner is currently visible — the
+agent has effectively paused itself between polls."
   :type 'regexp :group 'claude-dashboard)
 
-(defcustom claude-dashboard-monitoring-cmd-tail-chars 2000
-  "Trailing eat-buffer chars to scan for the most recent Bash tool call.
-A monitoring agent's last tool call is its most recent poll, so this
-just needs to be wide enough to find that call between polls."
-  :type 'integer :group 'claude-dashboard)
-
-(defun claude-dashboard--monitoring-p (inst)
-  "Return non-nil when INST appears to be monitoring an external process.
-Triggered by any of: a live spinner past one minute, a recent
-`Sleeping/Waiting/Polling/…' assistant message, or a most-recent Bash
-tool call whose body matches `claude-dashboard-monitoring-keywords-regexp'."
-  (when-let* ((buf (claude-dashboard-instance-buffer inst))
-              ((buffer-live-p buf)))
-    (with-current-buffer buf
-      (save-excursion
-        (or
-         ;; Live spinner: tight tail.
-         (let ((tail-start (max (point-min)
-                                (- (point-max)
-                                   claude-dashboard-monitoring-tail-chars))))
-           (goto-char (point-max))
-           (re-search-backward claude-dashboard-monitoring-regexp
-                               tail-start t))
-         ;; Explicit "Sleeping/Waiting/…" intent in a recent message.
-         (let ((tail-start (max (point-min)
-                                (- (point-max)
-                                   claude-dashboard-monitoring-cmd-tail-chars))))
-           (goto-char (point-max))
-           (re-search-backward claude-dashboard-monitoring-intent-regexp
-                               tail-start t))
-         ;; Latest executed bash tool call IS a monitoring one.
-         (let ((tail-start (max (point-min)
-                                (- (point-max)
-                                   claude-dashboard-monitoring-cmd-tail-chars))))
-           (goto-char (point-max))
-           (when (re-search-backward "●\\s-+Bash(" tail-start t)
-             (let* ((cmd-start (match-end 0))
-                    ;; Read up to the closing paren (or 800 chars cap),
-                    ;; spanning wrapped continuation lines so commands
-                    ;; like `… ; ps aux | …' on line 2 still count.
-                    (cmd-end (save-excursion
-                               (goto-char cmd-start)
-                               (if (re-search-forward
-                                    ")" (min (point-max) (+ cmd-start 800))
-                                    t)
-                                   (match-beginning 0)
-                                 (min (point-max) (+ cmd-start 800)))))
-                    (cmd (buffer-substring-no-properties cmd-start cmd-end)))
-               (string-match-p
-                claude-dashboard-monitoring-keywords-regexp cmd)))))))))
-
-(defcustom claude-dashboard-running-regexp "esc to interrupt"
-  "Regexp for an active Claude Code spinner of any duration.
-A match in the eat buffer's tail means Claude is currently
-generating tokens or running a tool.  Absence (and no monitoring /
-awaiting signal) means the agent is idle, regardless of how
-recently bytes were last written to the buffer — that way focusing
-the eat buffer (which causes cosmetic redraws) doesn't flip the
-row to RUN."
+(defcustom claude-dashboard-cursor-regexp
+  "^❯[[:space:]]*\\(.*?\\)[[:space:]]*$"
+  "Regexp for the prompt cursor line at the bottom of the eat buffer.
+Group 1 captures the text immediately following the cursor — empty for
+a free-text prompt, or a menu option label like `Yes', `1.', or
+`Continue' when Claude is presenting choices."
   :type 'regexp :group 'claude-dashboard)
 
-(defcustom claude-dashboard-running-tail-chars 300
-  "Trailing eat-buffer chars to scan for the active spinner."
-  :type 'integer :group 'claude-dashboard)
+(defcustom claude-dashboard-menu-option-regexp
+  "\\`\\(?:[0-9]+[. )]?\\|Yes\\|No\\|[A-Z][a-z]+\\)\\'"
+  "Regexp matched against the cursor's captured trailing text.
+A non-empty match means the cursor sits on a menu option, not on a
+free-text input line."
+  :type 'regexp :group 'claude-dashboard)
 
-(defun claude-dashboard--running-p (inst)
-  "Return non-nil when INST has an active Claude Code spinner in its tail."
-  (when-let* ((buf (claude-dashboard-instance-buffer inst))
-              ((buffer-live-p buf)))
-    (with-current-buffer buf
-      (save-excursion
-        (goto-char (point-max))
-        (let ((tail-start (max (point-min)
-                               (- (point-max)
-                                  claude-dashboard-running-tail-chars))))
-          (re-search-backward claude-dashboard-running-regexp
-                              tail-start t))))))
+(defun claude-dashboard--tail-beg ()
+  "Return the position `claude-dashboard-tail-chars' chars before point-max."
+  (max (point-min) (- (point-max) claude-dashboard-tail-chars)))
 
-(defun claude-dashboard--status (inst)
-  "Return a symbol summarizing INST's current state.
-One of `running' (active spinner in the eat buffer tail),
-`awaiting' (Claude is showing a menu of options for the user to pick),
-`monitoring' (long-running tool / sleeping / polling intent),
-`idle' (process alive, no spinner, no menu),
-or `exited' (process is gone)."
+(defun claude-dashboard--cursor-trailing (tail-beg)
+  "Return the menu-option text on the most recent prompt cursor line.
+Searches backward from point-max to TAIL-BEG.  Returns nil when no
+cursor is visible, or a (possibly empty) string when one is found."
+  (save-excursion
+    (goto-char (point-max))
+    (when (re-search-backward claude-dashboard-cursor-regexp tail-beg t)
+      (match-string-no-properties 1))))
+
+(defun claude-dashboard--last-bash-cmd (tail-beg)
+  "Return the body of the most recent `Bash(...)' tool call in the tail.
+Search begins at point-max and stops at TAIL-BEG.  The body extends to
+the matching `)' (capped at 800 chars) so commands wrapped across
+continuation lines still classify."
+  (save-excursion
+    (goto-char (point-max))
+    (when (re-search-backward "●[[:space:]]+Bash(" tail-beg t)
+      (let* ((cmd-start (match-end 0))
+             (cap (min (point-max) (+ cmd-start 800)))
+             (cmd-end (save-excursion
+                        (goto-char cmd-start)
+                        (if (re-search-forward ")" cap t)
+                            (match-beginning 0)
+                          cap))))
+        (buffer-substring-no-properties cmd-start cmd-end)))))
+
+(defun claude-dashboard--last-question-mark-p (tail-beg)
+  "Return non-nil when the closest sentence-final punct above point is `?'.
+\"Sentence-final\" means `.', `!', or `?' followed only by whitespace at
+end of line.  Used to distinguish a free-text question from an idle
+prompt: if the last thing Claude wrote ended in `.' or `!' it was a
+statement, not a question."
+  (save-excursion
+    (when (re-search-backward "[.!?][[:space:]]*$" tail-beg t)
+      (eq (char-after (1- (match-end 0))) ??))))
+
+(defun claude-dashboard--classify (inst)
+  "Classify INST into one of the five phase symbols.
+See the `;;; --- Phase classification' commentary above for the full
+state machine.  Reads the eat buffer tail exactly once per call."
   (let ((proc (claude-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
-     ((or (claude-dashboard--awaiting-input-p inst)
-          (claude-dashboard--free-text-prompt-p inst))
-      'awaiting)
-     ((claude-dashboard--monitoring-p inst) 'monitoring)
-     ((claude-dashboard--running-p inst) 'running)
-     (t 'idle))))
+     (t
+      (with-current-buffer (claude-dashboard-instance-buffer inst)
+        (let* ((tail-beg (claude-dashboard--tail-beg))
+               (spinner-p (save-excursion
+                            (goto-char (point-max))
+                            (re-search-backward
+                             claude-dashboard-spinner-regexp tail-beg t)))
+               (intent-p (save-excursion
+                           (goto-char (point-max))
+                           (re-search-backward
+                            claude-dashboard-monitoring-intent-regexp
+                            tail-beg t))))
+          (cond
+           ;; Active spinner OR explicit waiting intent → running family.
+           ((or spinner-p intent-p)
+            (let ((cmd (claude-dashboard--last-bash-cmd tail-beg)))
+              (if (or intent-p
+                      (and cmd
+                           (string-match-p
+                            claude-dashboard-monitoring-cmd-regexp cmd)))
+                  'monitoring
+                'running)))
+           ;; No spinner: examine the prompt cursor.
+           (t
+            (let ((trailing (claude-dashboard--cursor-trailing tail-beg)))
+              (cond
+               ;; No cursor visible — fall back to idle.
+               ((null trailing) 'idle)
+               ;; Cursor with a menu option attached.
+               ((and (> (length trailing) 0)
+                     (string-match-p
+                      claude-dashboard-menu-option-regexp trailing))
+                'awaiting)
+               ;; Bare cursor: question vs statement.
+               ((save-excursion
+                  (goto-char (point-max))
+                  (re-search-backward claude-dashboard-cursor-regexp
+                                      tail-beg t)
+                  (claude-dashboard--last-question-mark-p tail-beg))
+                'awaiting)
+               (t 'idle)))))))))))
+
+(defun claude-dashboard--status (inst)
+  "Return INST's current phase symbol.
+Thin wrapper around `claude-dashboard--classify'; preserved as the
+public entry point for callers like the renderer and `--maybe-auto-name'."
+  (claude-dashboard--classify inst))
 
 (defun claude-dashboard--state-color (status)
   (pcase status
