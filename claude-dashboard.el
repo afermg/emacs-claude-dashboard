@@ -139,6 +139,45 @@ cursor, anchoring the match to the visible bottom of the terminal."
                 (re-search-forward "^\\s-*[0-9]+\\.\\|\\bNo\\b\\|\\bYes\\b"
                                    (point-max) t)))))))))
 
+(defcustom claude-dashboard-question-tail-chars 1500
+  "Trailing eat-buffer chars scanned for a free-text question.
+Larger than `claude-dashboard-awaiting-tail-chars' because the question
+mark and the bare prompt cursor may be separated by the bordered input
+box plus footer lines."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-question-max-line-distance 30
+  "Max lines between the trailing question mark and the bare prompt cursor.
+Bounds how far back `claude-dashboard--free-text-prompt-p' will look so
+a stray earlier `?' does not keep a row stuck on the awaiting glyph."
+  :type 'integer :group 'claude-dashboard)
+
+(defun claude-dashboard--free-text-prompt-p (inst)
+  "Return non-nil when INST is awaiting a free-text reply.
+Catches plain-prose questions like `OK to publish, or stop at draft?'
+that the menu-only `claude-dashboard--awaiting-input-p' misses.
+Heuristic: the buffer tail contains a bare `\\=`❯' prompt cursor (no
+menu option attached) AND the closest preceding non-blank line, within
+`claude-dashboard-question-max-line-distance' lines, ends with `?'."
+  (when-let* ((buf (claude-dashboard-instance-buffer inst))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (save-excursion
+        (let ((tail-start (max (point-min)
+                               (- (point-max)
+                                  claude-dashboard-question-tail-chars))))
+          (goto-char (point-max))
+          ;; Use [[:space:]] (not [ \t]) so the bare cursor line still
+          ;; matches when Claude Code pads it with a non-breaking space.
+          (when (re-search-backward "^❯[[:space:]]*$" tail-start t)
+            (let ((cursor-line (line-number-at-pos))
+                  (cursor-bol (line-beginning-position)))
+              (save-excursion
+                (goto-char cursor-bol)
+                (and (re-search-backward "\\?[[:space:]]*$" tail-start t)
+                     (<= (- cursor-line (line-number-at-pos))
+                         claude-dashboard-question-max-line-distance))))))))))
+
 (defcustom claude-dashboard-monitoring-regexp
   "[0-9]+m[ \t]+[0-9]+s[^\n]*esc to interrupt"
   "Regexp for a *live* monitoring spinner in the eat buffer tail.
@@ -429,7 +468,9 @@ or `exited' (process is gone)."
   (let ((proc (claude-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
-     ((claude-dashboard--awaiting-input-p inst) 'awaiting)
+     ((or (claude-dashboard--awaiting-input-p inst)
+          (claude-dashboard--free-text-prompt-p inst))
+      'awaiting)
      ((claude-dashboard--monitoring-p inst) 'monitoring)
      ((claude-dashboard--running-p inst) 'running)
      (t 'idle))))
