@@ -690,11 +690,26 @@ separators, so e.g. `/home/me/projects/gsk_broad/' becomes
 
 ;;; Activity tracking via eat-update-hook
 
+(defvar-local claude-dashboard--last-eat-pmax nil
+  "Buffer-local: last `point-max' we observed when noting activity.
+Compared in `claude-dashboard--note-activity' so cosmetic eat
+redraws (cursor blinks, focus changes, status-line repaints) do
+not get counted as new output — they don't grow the buffer.")
+
 (defun claude-dashboard--note-activity ()
-  "Buffer-local hook on `eat-update-hook' that bumps last-output time."
-  (let ((inst (gethash (current-buffer) claude-dashboard--instances)))
+  "Bump last-output only when the eat buffer actually grew.
+`eat-update-hook' fires on every redraw, including ones triggered
+by switching focus into the eat buffer.  Real output from the
+agent appends to the buffer (point-max grows); cosmetic redraws
+don't.  Gating on size growth keeps focus from flipping a row's
+status to RUN."
+  (let* ((inst (gethash (current-buffer) claude-dashboard--instances))
+         (pmax (point-max)))
     (when inst
-      (setf (claude-dashboard-instance-last-output inst) (float-time)))))
+      (when (or (null claude-dashboard--last-eat-pmax)
+                (> pmax claude-dashboard--last-eat-pmax))
+        (setf (claude-dashboard-instance-last-output inst) (float-time)))
+      (setq claude-dashboard--last-eat-pmax pmax))))
 
 ;;; Launch
 
