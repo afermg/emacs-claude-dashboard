@@ -101,36 +101,28 @@ against rather than what the worktree currently points at.")
     (get-buffer-process (claude-dashboard-instance-buffer inst))))
 
 (defcustom claude-dashboard-awaiting-regexp
-  "❯[ \t]+\\(?:[0-9]+\\b\\|Yes\\b\\|No\\b\\|[A-Z][a-z]+\\b\\)"
-  "Regexp for the cursor on a Claude Code menu option.
-Matches `❯ 1', `❯ 1.', `❯ 1)', `❯ Yes', `❯ No', and capitalised
-verbs like `❯ Continue', `❯ Skip', `❯ Approve', `❯ Cancel'.  The
-cursor regexp alone is liberal; `--awaiting-input-p' additionally
-requires a sibling option strictly after the cursor before
-classifying the row as awaiting."
+  "❯ +\\(?:[0-9]+\\.\\|Yes\\b\\|No\\b\\)"
+  "Regexp matched against the tail of the eat buffer.
+Designed to match the cursor on a Claude Code menu of options
+\(numbered options like \"❯ 1.\" or a Yes/No prompt arrow).  A match
+means the user has options to choose from, not just that Claude is
+quiet."
   :type 'regexp :group 'claude-dashboard)
 
-(defcustom claude-dashboard-awaiting-sibling-regexp
-  "^[ \t]+\\(?:[0-9]+[. )]\\|Yes\\b\\|No\\b\\|Skip\\b\\|Cancel\\b\\|Continue\\b\\|Approve\\b\\|Reject\\b\\|Abort\\b\\)"
-  "Regexp for a non-cursor menu option appearing after the cursor.
-A line starting with whitespace + a numbered marker, or with one of
-the common verb labels Claude uses in selection prompts.  Used as
-the sibling-confirmation step to avoid false positives from prose
-that quotes `❯ Yes'."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-awaiting-tail-chars 600
-  "Trailing eat-buffer chars to scan for a pending menu.
-Wider than the live-spinner window: Claude's menus can span ~10
-lines (multiple options + framing) so we need a generous tail."
+(defcustom claude-dashboard-awaiting-tail-chars 300
+  "Number of trailing eat-buffer chars to scan for a pending menu.
+A real Claude Code menu cursor + remaining option lines fits in a
+few hundred chars, so once Claude streams any new output after the
+menu the cursor falls out of this window and the row stops showing
+the awaiting glyph."
   :type 'integer :group 'claude-dashboard)
 
 (defun claude-dashboard--awaiting-input-p (inst)
   "Return non-nil when INST is presenting a menu of options to the user.
 Looks only at the last `claude-dashboard-awaiting-tail-chars' of the
-eat buffer.  Requires `claude-dashboard-awaiting-regexp' (the menu
-cursor) AND `claude-dashboard-awaiting-sibling-regexp' (another
-option) strictly after the cursor."
+eat buffer.  Requires the menu-cursor regexp AND a sibling option
+\(another numbered line or Yes/No token) appearing strictly after the
+cursor, anchoring the match to the visible bottom of the terminal."
   (when-let* ((buf (claude-dashboard-instance-buffer inst))
               ((buffer-live-p buf)))
     (with-current-buffer buf
@@ -144,9 +136,8 @@ option) strictly after the cursor."
             (let ((cursor-end (match-end 0)))
               (save-excursion
                 (goto-char cursor-end)
-                (re-search-forward
-                 claude-dashboard-awaiting-sibling-regexp
-                 (point-max) t)))))))))
+                (re-search-forward "^\\s-*[0-9]+\\.\\|\\bNo\\b\\|\\bYes\\b"
+                                   (point-max) t)))))))))
 
 (defcustom claude-dashboard-monitoring-regexp
   "[0-9]+m[ \t]+[0-9]+s[^\n]*esc to interrupt"
