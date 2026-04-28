@@ -11,8 +11,7 @@
 ;; A single buffer that lists Claude Code instances launched from Emacs,
 ;; each running in its own eat terminal buffer rooted at a project
 ;; directory.  Press `n' to launch a new instance, RET to jump in, `k'
-;; to exit it gracefully, `r' to restart, `g' to refresh, `?' for the
-;; transient menu.
+;; to exit it gracefully, `g' to refresh, `?' for the transient menu.
 
 ;;; Code:
 
@@ -1815,7 +1814,6 @@ three progressive views: rows-only (1), rows + queries (2), rows
   ["Lifecycle (marked or row)"
    ("k"   "quit (row)"      claude-dashboard-quit-instance)
    ("K"   "kill buf (row)"  claude-dashboard-kill-buffer)
-   ("r"   "restart (row)"   claude-dashboard-restart)
    ("D"   "quit marked"     claude-dashboard-do-quit)
    ("x"   "kill marked"     claude-dashboard-do-kill)]
   ["Dashboard"
@@ -1853,7 +1851,10 @@ three progressive views: rows-only (1), rows + queries (2), rows
     ;; Lifecycle on the row at point
     (define-key map "k"         #'claude-dashboard-quit-instance)
     (define-key map "K"         #'claude-dashboard-kill-buffer)
-    (define-key map "r"         #'claude-dashboard-restart)
+    ;; `claude-dashboard-restart' deliberately has no keybinding —
+    ;; restart spawns a fresh claude (no --resume), throwing away the
+    ;; conversation context, which is rarely what you want when your
+    ;; finger slips.  Reachable via `M-x' for the deliberate case.
     ;; Dashboard-level
     (define-key map "N"         #'claude-dashboard-new)
     (define-key map "b"         #'claude-dashboard-new-worktree)
@@ -1867,6 +1868,11 @@ three progressive views: rows-only (1), rows + queries (2), rows
 (define-key claude-dashboard-mode-map "w" #'claude-dashboard-copy-topic)
 (define-key claude-dashboard-mode-map "T" #'claude-dashboard-name-instance)
 (define-key claude-dashboard-mode-map "b" #'claude-dashboard-new-worktree)
+;; Explicitly unbind `r' (was `claude-dashboard-restart') — restart
+;; spawns a fresh claude with no `--resume', dropping the conversation,
+;; which is too easy to do by accident with a single-letter binding.
+;; Reachable via `M-x claude-dashboard-restart' for the deliberate case.
+(define-key claude-dashboard-mode-map "r" nil)
 
 (define-derived-mode claude-dashboard-mode magit-section-mode "ClaudeDash"
   "Major mode for the Claude Code instance dashboard."
