@@ -1141,8 +1141,19 @@ screen sessions that survived the previous session."
   (when (claude-dashboard--screen-session-exists-p name)
     (call-process "screen" nil nil nil "-S" name "-X" "quit")))
 
-(defun claude-dashboard--exec-eat (buf name program args)
-  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks."
+(defcustom claude-dashboard-screen-term "xterm-256color"
+  "TERM value to use when attaching to a screen session via eat.
+Eat's default `eat-256color' has a `clear' terminfo entry GNU
+screen rejects (\"Clear screen capability required\"), so the
+screen-attach path must override TERM.  `xterm-256color' is the
+safest universally-installed value."
+  :type 'string :group 'claude-dashboard)
+
+(defun claude-dashboard--exec-eat (buf name program args &optional term)
+  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks.
+When TERM is non-nil, override `eat-term-name' buffer-locally
+before eat-exec runs — required for `screen -x' since screen
+rejects eat's default TERM (\"Clear screen capability required\")."
   (with-current-buffer buf
     ;; Eat's shell-prompt annotation reserves a one-column left margin.
     ;; Claude Code is a TUI app, not a shell — the column shifts the
@@ -1151,6 +1162,10 @@ screen sessions that survived the previous session."
     ;; `eat-mode' runs so the margin isn't installed in this buffer.
     (setq-local eat-enable-shell-prompt-annotation nil)
     (unless (derived-mode-p 'eat-mode) (eat-mode))
+    ;; Must be set AFTER `eat-mode' — its initialiser resets
+    ;; `eat-term-name' to its defcustom default.
+    (when (and term (boundp 'eat-term-name))
+      (setq-local eat-term-name term))
     (eat-exec buf name program nil args)))
 
 (defun claude-dashboard--write-manifest ()
@@ -1206,8 +1221,10 @@ session's name is recorded in `claude-dashboard--screen-sessions'
                "-dmS" session
                claude-dashboard-program args)
         ;; 2. Attach via eat — screen owns the PTY; eat is one client.
+        ;; TERM override required: see `claude-dashboard-screen-term'.
         (claude-dashboard--exec-eat buf name "screen"
-                                    (list "-x" session))
+                                    (list "-x" session)
+                                    claude-dashboard-screen-term)
         ;; 3. Remember the session for cleanup + manifest.
         (puthash buf session claude-dashboard--screen-sessions)))
      (t
@@ -1252,7 +1269,8 @@ since exited) are silently skipped.  Requires
                        (or (and (not (get-buffer buffer-name)) buffer-name)
                            (claude-dashboard--unique-buffer-name cwd)))))
             (claude-dashboard--exec-eat buf (buffer-name buf) "screen"
-                                        (list "-x" session))
+                                        (list "-x" session)
+                                        claude-dashboard-screen-term)
             (puthash buf session claude-dashboard--screen-sessions)
             (claude-dashboard--register buf cwd)
             (cl-incf restored))))))
