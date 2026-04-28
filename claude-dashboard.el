@@ -272,190 +272,75 @@ user prompt).  Useful when you want to override or backfill."
 
 ;;; --- Phase classification ------------------------------------------------
 ;;
-;; A Claude Code instance moves through five phases at runtime:
+;; Three phases:
+;;   `exited'   OS process is gone.
+;;   `running'  Spinner (`esc to interrupt') visible in the eat tail.
+;;   `idle'     Process alive, no spinner.
 ;;
-;;   `exited'     OS process is gone.
-;;   `running'    Spinner visible in the buffer tail — Claude is
-;;                actively producing output or running a tool call.
-;;   `monitoring' Variant of `running': the live tool call is a
-;;                polling / sleep / watch command, OR Claude
-;;                announced a deliberate wait such as
-;;                `● Sleeping while nb03 exports.'.
-;;   `awaiting'   No spinner; bordered prompt box visible at bottom;
-;;                either a menu option is attached to the cursor, or
-;;                the last sentence Claude wrote ended with `?'.
-;;   `idle'       Default fallback — process alive, no spinner, no
-;;                pending question.
-;;
-;; All five are decided by a single classifier `claude-dashboard--classify'
-;; which reads the last `claude-dashboard-tail-chars' of the eat buffer
-;; once per call.  The entry point `claude-dashboard--status' is a thin
-;; wrapper preserved so existing callers (auto-name, header rendering,
-;; status-rank) keep working unchanged.
+;; Earlier versions tried to detect `awaiting' (a pending menu / question)
+;; and `monitoring' (polling / sleeping); both proved unreliable enough
+;; that they misclassified more often than they helped, so they're gone.
+
+(defcustom claude-dashboard-fit-window t
+  "Resize the dashboard's window to its content after each render.
+When non-nil, the dashboard is docked as a side window at
+`claude-dashboard-side' and its height is fit to the visible
+content (heading + column header + one line per instance).
+Set to nil to let your usual window-management rules size it."
+  :type 'boolean :group 'claude-dashboard)
+
+(defcustom claude-dashboard-fit-min-height 4
+  "Minimum number of lines the dashboard window may shrink to."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-side 'bottom
+  "Frame side the dashboard occupies when `claude-dashboard-fit-window' is on.
+One of `top' or `bottom'.  Side windows give `fit-window-to-buffer'
+something to shrink against (the rest of the frame), so the
+dashboard ends up at the minimum height that shows all rows."
+  :type '(choice (const top) (const bottom)) :group 'claude-dashboard)
 
 (defcustom claude-dashboard-tail-chars 2000
-  "Trailing eat-buffer chars used by `claude-dashboard--classify'.
-Wide enough to span a multi-option menu plus its framing borders, the
-gap between a spinner and its triggering Bash tool call, and the two
-or three short sentences a question typically sits in."
+  "Trailing eat-buffer chars used by `claude-dashboard--status'.
+Wide enough to catch the spinner across the framing borders that may
+sit between it and point-max."
   :type 'integer :group 'claude-dashboard)
 
 (defcustom claude-dashboard-spinner-regexp "esc to interrupt"
   "Regexp marking Claude Code's live progress spinner.
 Match anywhere in the tail means the agent is actively working
-(generating tokens or running a tool).  Absence — combined with no
-explicit waiting intent — drops the row out of the `running' family
-into `awaiting' or `idle' depending on the prompt cursor."
+\(generating tokens or running a tool); absence means it's idle."
   :type 'regexp :group 'claude-dashboard)
 
-(defcustom claude-dashboard-monitoring-cmd-regexp
-  (concat "\\(?:"
-          "pgrep\\|pidof\\|\\bps\\b\\|tail -[fnFN]"
-          "\\|screen -ls\\|tmux ls\\|watch \\b"
-          "\\|journalctl\\|systemctl status"
-          "\\|nvidia-smi\\|rocm-smi\\|htop\\|top -b"
-          "\\|kubectl get\\|kubectl logs\\|docker ps\\|docker logs"
-          "\\|\\bsleep [0-9]\\|ping \\b"
-          "\\)")
-  "Regexp of shell verbs that indicate a polling / monitoring tool call.
-Matched against the body of the most recent `Bash(...)' tool call when
-deciding whether a `running' instance is really `monitoring'."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-monitoring-intent-regexp
-  "^●[[:space:]]+\\(?:Sleeping\\|Waiting\\|Polling\\|Monitoring\\|Watching\\)\\b"
-  "Regexp marking an assistant message that declares a deliberate wait.
-Triggers `monitoring' even when no spinner is currently visible — the
-agent has effectively paused itself between polls."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-cursor-regexp
-  "^❯[[:space:]]*\\(.*?\\)[[:space:]]*$"
-  "Regexp for the prompt cursor line at the bottom of the eat buffer.
-Group 1 captures the text immediately following the cursor — empty for
-a free-text prompt, or a menu option label like `Yes', `1.', or
-`Continue' when Claude is presenting choices."
-  :type 'regexp :group 'claude-dashboard)
-
-(defcustom claude-dashboard-menu-option-regexp
-  "\\`\\(?:[0-9]+[. )]?\\|Yes\\|No\\|[A-Z][a-z]+\\)\\'"
-  "Regexp matched against the cursor's captured trailing text.
-A non-empty match means the cursor sits on a menu option, not on a
-free-text input line."
-  :type 'regexp :group 'claude-dashboard)
-
-(defun claude-dashboard--tail-beg ()
-  "Return the position `claude-dashboard-tail-chars' chars before point-max."
-  (max (point-min) (- (point-max) claude-dashboard-tail-chars)))
-
-(defun claude-dashboard--cursor-trailing (tail-beg)
-  "Return the menu-option text on the most recent prompt cursor line.
-Searches backward from point-max to TAIL-BEG.  Returns nil when no
-cursor is visible, or a (possibly empty) string when one is found."
-  (save-excursion
-    (goto-char (point-max))
-    (when (re-search-backward claude-dashboard-cursor-regexp tail-beg t)
-      (match-string-no-properties 1))))
-
-(defun claude-dashboard--last-bash-cmd (tail-beg)
-  "Return the body of the most recent `Bash(...)' tool call in the tail.
-Search begins at point-max and stops at TAIL-BEG.  The body extends to
-the matching `)' (capped at 800 chars) so commands wrapped across
-continuation lines still classify."
-  (save-excursion
-    (goto-char (point-max))
-    (when (re-search-backward "●[[:space:]]+Bash(" tail-beg t)
-      (let* ((cmd-start (match-end 0))
-             (cap (min (point-max) (+ cmd-start 800)))
-             (cmd-end (save-excursion
-                        (goto-char cmd-start)
-                        (if (re-search-forward ")" cap t)
-                            (match-beginning 0)
-                          cap))))
-        (buffer-substring-no-properties cmd-start cmd-end)))))
-
-(defun claude-dashboard--last-question-mark-p (tail-beg)
-  "Return non-nil when the closest sentence-final punct above point is `?'.
-\"Sentence-final\" means `.', `!', or `?' followed only by whitespace at
-end of line.  Used to distinguish a free-text question from an idle
-prompt: if the last thing Claude wrote ended in `.' or `!' it was a
-statement, not a question."
-  (save-excursion
-    (when (re-search-backward "[.!?][[:space:]]*$" tail-beg t)
-      (eq (char-after (1- (match-end 0))) ??))))
-
-(defun claude-dashboard--classify (inst)
-  "Classify INST into one of the five phase symbols.
-See the `;;; --- Phase classification' commentary above for the full
-state machine.  Reads the eat buffer tail exactly once per call."
+(defun claude-dashboard--status (inst)
+  "Return INST's current phase symbol: `exited', `running', or `idle'."
   (let ((proc (claude-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
-     (t
-      (with-current-buffer (claude-dashboard-instance-buffer inst)
-        (let* ((tail-beg (claude-dashboard--tail-beg))
-               (spinner-p (save-excursion
-                            (goto-char (point-max))
-                            (re-search-backward
-                             claude-dashboard-spinner-regexp tail-beg t)))
-               (intent-p (save-excursion
-                           (goto-char (point-max))
-                           (re-search-backward
-                            claude-dashboard-monitoring-intent-regexp
-                            tail-beg t))))
-          (cond
-           ;; Active spinner OR explicit waiting intent → running family.
-           ((or spinner-p intent-p)
-            (let ((cmd (claude-dashboard--last-bash-cmd tail-beg)))
-              (if (or intent-p
-                      (and cmd
-                           (string-match-p
-                            claude-dashboard-monitoring-cmd-regexp cmd)))
-                  'monitoring
-                'running)))
-           ;; No spinner: examine the prompt cursor.
-           (t
-            (let ((trailing (claude-dashboard--cursor-trailing tail-beg)))
-              (cond
-               ;; No cursor visible — fall back to idle.
-               ((null trailing) 'idle)
-               ;; Cursor with a menu option attached.
-               ((and (> (length trailing) 0)
-                     (string-match-p
-                      claude-dashboard-menu-option-regexp trailing))
-                'awaiting)
-               ;; Bare cursor: question vs statement.
-               ((save-excursion
-                  (goto-char (point-max))
-                  (re-search-backward claude-dashboard-cursor-regexp
-                                      tail-beg t)
-                  (claude-dashboard--last-question-mark-p tail-beg))
-                'awaiting)
-               (t 'idle)))))))))))
-
-(defun claude-dashboard--status (inst)
-  "Return INST's current phase symbol.
-Thin wrapper around `claude-dashboard--classify'; preserved as the
-public entry point for callers like the renderer and `--maybe-auto-name'."
-  (claude-dashboard--classify inst))
+     ((with-current-buffer (claude-dashboard-instance-buffer inst)
+        (save-excursion
+          (goto-char (point-max))
+          (re-search-backward claude-dashboard-spinner-regexp
+                              (max (point-min)
+                                   (- (point-max)
+                                      claude-dashboard-tail-chars))
+                              t)))
+      'running)
+     (t 'idle))))
 
 (defun claude-dashboard--state-color (status)
   (pcase status
-    ('running    "#22cc22")
-    ('awaiting   "#f5a623")
-    ('monitoring "#36c0c0")
-    ('idle       "#3b9bff")
-    ('exited     "#ff4d4d")
-    (_           "gray60")))
+    ('running "#22cc22")
+    ('idle    "#3b9bff")
+    ('exited  "#ff4d4d")
+    (_        "gray60")))
 
 (defun claude-dashboard--status-glyph (status)
   (let ((face `(:foreground ,(claude-dashboard--state-color status) :weight bold)))
     (pcase status
-      ('running    (propertize "●" 'face face))
-      ('awaiting   (propertize "?" 'face face))
-      ('monitoring (propertize "↻" 'face face))
-      ('idle       (propertize "◐" 'face face))
-      ('exited     (propertize "○" 'face face)))))
+      ('running (propertize "●" 'face face))
+      ('idle    (propertize "◐" 'face face))
+      ('exited  (propertize "○" 'face face)))))
 
 (defun claude-dashboard--humanize-duration (secs)
   "Format SECS as a short human-readable string (e.g. 12s, 3m, 2h)."
@@ -1688,22 +1573,18 @@ second line on narrower windows."
 
 (defun claude-dashboard--state-abbrev (status)
   (pcase status
-    ('running    "RUN")
-    ('awaiting   "ASK")
-    ('monitoring "MON")
-    ('idle       "IDL")
-    ('exited     "EXT")
-    (_           "?")))
+    ('running "RUN")
+    ('idle    "IDL")
+    ('exited  "EXT")
+    (_        "?")))
 
 (defun claude-dashboard--status-rank (status)
   "Sort priority for STATUS: lower wins (sorts higher in the list)."
   (pcase status
-    ('awaiting   0)
-    ('running    1)
-    ('monitoring 2)
-    ('idle       3)
-    ('exited     4)
-    (_           5)))
+    ('running 0)
+    ('idle    1)
+    ('exited  2)
+    (_        3)))
 
 (defun claude-dashboard--instance-branch (inst)
   (or (claude-dashboard--cached
@@ -1949,6 +1830,28 @@ three progressive views: rows-only (1), rows + queries (2), rows
               (claude-dashboard--insert-instance-section
                inst branch-w topic-w))))))))
 
+(defun claude-dashboard--fit-window (buf)
+  "Shrink BUF's visible window to fit its content (when configured)."
+  (when claude-dashboard-fit-window
+    (when-let ((win (get-buffer-window buf 'visible)))
+      ;; Don't fit a window that's the only one in its frame — there's
+      ;; nothing to shrink to.
+      (unless (frame-root-window-p win)
+        (with-selected-window win
+          (fit-window-to-buffer
+           win nil claude-dashboard-fit-min-height nil nil t))))))
+
+(defun claude-dashboard--display-action ()
+  "Action argument for `display-buffer' that docks the dashboard.
+Returns a side-window action when `claude-dashboard-fit-window' is
+on; nil otherwise (so `display-buffer' uses default rules)."
+  (when claude-dashboard-fit-window
+    `((display-buffer-in-side-window)
+      (side          . ,claude-dashboard-side)
+      (slot          . 0)
+      (window-height . fit-window-to-buffer)
+      (preserve-size . (nil . t)))))
+
 (defun claude-dashboard--maybe-refresh ()
   "Re-render the dashboard if its buffer is live."
   ;; Auto-naming runs ahead of render so a freshly-injected /name has a
@@ -1961,7 +1864,8 @@ three progressive views: rows-only (1), rows + queries (2), rows
         (let ((line (line-number-at-pos)))
           (claude-dashboard--render)
           (goto-char (point-min))
-          (forward-line (1- line)))))))
+          (forward-line (1- line))))
+      (claude-dashboard--fit-window buf))))
 
 (defun claude-dashboard-refresh ()
   "Re-render the dashboard."
@@ -2094,16 +1998,24 @@ three progressive views: rows-only (1), rows + queries (2), rows
 
 ;;;###autoload
 (defun claude-dashboard ()
-  "Open the Claude Code dashboard."
+  "Open the Claude Code dashboard.
+With `claude-dashboard-fit-window' (default), the buffer is docked
+as a side window at `claude-dashboard-side' so it occupies only the
+rows needed to show the current instances; otherwise standard
+display rules apply."
   (interactive)
   (let ((buf (get-buffer-create claude-dashboard-buffer-name)))
     (with-current-buffer buf
       (claude-dashboard-mode)
       (claude-dashboard--render)
       (claude-dashboard--goto-first-instance))
-    (pop-to-buffer buf)
+    (let ((action (claude-dashboard--display-action)))
+      (if action
+          (pop-to-buffer buf action)
+        (pop-to-buffer buf)))
     (with-current-buffer buf
-      (claude-dashboard--goto-first-instance))))
+      (claude-dashboard--goto-first-instance))
+    (claude-dashboard--fit-window buf)))
 
 (provide 'claude-dashboard)
 ;;; claude-dashboard.el ends here
