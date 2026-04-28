@@ -997,8 +997,17 @@ Returns a `claude-dashboard-past-session' or signals."
                                                'font-lock-comment-face))))
                (cons label s)))
            filtered))
-         (choice (completing-read "Resume session: "
-                                  (mapcar #'car table) nil t)))
+         (labels (mapcar #'car table))
+         ;; Wrap in a metadata-providing completion table so vertico /
+         ;; ivy / ido / default emacs all preserve our newest-first
+         ;; mtime order instead of re-sorting alphabetically.
+         (collection
+          (lambda (string pred action)
+            (if (eq action 'metadata)
+                '(metadata (display-sort-function . identity)
+                           (cycle-sort-function . identity))
+              (complete-with-action action labels string pred))))
+         (choice (completing-read "Resume session: " collection nil t)))
     (cdr (assoc choice table))))
 
 (defun claude-dashboard--candidate-projects ()
@@ -1083,29 +1092,174 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
     inst))
 
 (defun claude-dashboard--on-buffer-killed ()
+  (let ((session (gethash (current-buffer)
+                          claude-dashboard--screen-sessions)))
+    (claude-dashboard--kill-screen-session session)
+    (remhash (current-buffer) claude-dashboard--screen-sessions))
   (remhash (current-buffer) claude-dashboard--instances)
+  (claude-dashboard--write-manifest)
   (claude-dashboard--maybe-refresh))
 
+;;; Multiplexer (GNU screen) integration
+
+(defcustom claude-dashboard-multiplexer nil
+  "Optional terminal multiplexer wrapping each claude process.
+nil      — direct eat subprocess (default; processes die when emacs exits).
+`screen' — each instance runs inside a detached GNU screen session;
+           eat attaches via `screen -x'.  The session survives emacs
+           exit, so `claude-dashboard-restore' on a fresh emacs can
+           re-attach to all surviving claudes.  Requires the `screen'
+           binary to be in PATH."
+  :type '(choice (const :tag "Direct (no multiplexer)" nil)
+                 (const :tag "GNU screen" screen))
+  :group 'claude-dashboard)
+
+(defcustom claude-dashboard-manifest-file
+  (expand-file-name "dashboard-manifest.el" claude-dashboard-claude-dir)
+  "File where dashboard records each multiplexed instance's metadata.
+Read by `claude-dashboard-restore' on a fresh emacs to re-attach to
+screen sessions that survived the previous session."
+  :type 'file :group 'claude-dashboard)
+
+(defvar claude-dashboard--screen-sessions (make-hash-table :test 'eq)
+  "Map buffer → screen-session-name (string) for multiplexed instances.")
+
+(defun claude-dashboard--screen-session-name (cwd)
+  "Generate a unique screen session name keyed off CWD's project name."
+  (format "claude-dashboard.%s.%d"
+          (file-name-nondirectory (directory-file-name cwd))
+          (random 1000000)))
+
+(defun claude-dashboard--screen-session-exists-p (name)
+  "Return non-nil when a screen session NAME is currently running."
+  (and name
+       (zerop (call-process "screen" nil nil nil
+                            "-S" name "-Q" "select" "."))))
+
+(defun claude-dashboard--kill-screen-session (name)
+  "Terminate screen session NAME, if any."
+  (when (claude-dashboard--screen-session-exists-p name)
+    (call-process "screen" nil nil nil "-S" name "-X" "quit")))
+
+(defun claude-dashboard--exec-eat (buf name program args)
+  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks."
+  (with-current-buffer buf
+    ;; Eat's shell-prompt annotation reserves a one-column left margin.
+    ;; Claude Code is a TUI app, not a shell — the column shifts the
+    ;; whole frame right and clips the right edge of the boxed prompt,
+    ;; producing an apparent extra wrap line.  Disable it before
+    ;; `eat-mode' runs so the margin isn't installed in this buffer.
+    (setq-local eat-enable-shell-prompt-annotation nil)
+    (unless (derived-mode-p 'eat-mode) (eat-mode))
+    (eat-exec buf name program nil args)))
+
+(defun claude-dashboard--write-manifest ()
+  "Persist running multiplexed instances to `claude-dashboard-manifest-file'.
+Each entry is a plist (:cwd :session :buffer-name :recorded).  Direct
+\(non-multiplexed) instances are NOT recorded — they cannot be
+restored after emacs exits anyway."
+  (when (and (eq claude-dashboard-multiplexer 'screen)
+             claude-dashboard-manifest-file)
+    (let ((entries
+           (cl-loop for inst in (claude-dashboard--instances-list)
+                    for buf = (claude-dashboard-instance-buffer inst)
+                    for session = (gethash buf
+                                            claude-dashboard--screen-sessions)
+                    when session
+                    collect (list :cwd (claude-dashboard-instance-cwd inst)
+                                  :session session
+                                  :buffer-name (buffer-name buf)
+                                  :recorded (current-time)))))
+      (let ((dir (file-name-directory claude-dashboard-manifest-file)))
+        (when (and dir (not (file-directory-p dir)))
+          (make-directory dir t)))
+      (with-temp-file claude-dashboard-manifest-file
+        (insert ";;; -*- lisp-data -*-\n")
+        (let ((print-level nil) (print-length nil))
+          (prin1 entries (current-buffer)))
+        (insert "\n")))))
+
+(defun claude-dashboard--read-manifest ()
+  "Read `claude-dashboard-manifest-file' and return the entry list, or nil."
+  (when (and claude-dashboard-manifest-file
+             (file-readable-p claude-dashboard-manifest-file))
+    (with-temp-buffer
+      (insert-file-contents claude-dashboard-manifest-file)
+      (goto-char (point-min))
+      (ignore-errors (read (current-buffer))))))
+
 (defun claude-dashboard--launch (cwd extra-args)
-  "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer."
+  "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer.
+When `claude-dashboard-multiplexer' is `screen', wraps the process
+in a detached GNU screen session that survives emacs exit; the
+session's name is recorded in `claude-dashboard--screen-sessions'
+\(keyed by buffer) and persisted to the manifest file."
   (let* ((default-directory cwd)
          (name (claude-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (args (append claude-dashboard-program-args extra-args)))
-    (with-current-buffer buf
-      ;; Eat's shell-prompt annotation reserves a one-column left margin.
-      ;; Claude Code is a TUI app, not a shell — the column shifts the
-      ;; whole frame right and clips the right edge of the boxed prompt,
-      ;; producing an apparent extra wrap line.  Disable it before
-      ;; `eat-mode' runs so the margin isn't installed in this buffer.
-      (setq-local eat-enable-shell-prompt-annotation nil)
-      (unless (derived-mode-p 'eat-mode)
-        (eat-mode))
-      (eat-exec buf name claude-dashboard-program nil args))
+    (cond
+     ((eq claude-dashboard-multiplexer 'screen)
+      (let ((session (claude-dashboard--screen-session-name cwd)))
+        ;; 1. Spawn a detached screen session running claude.
+        (apply #'call-process "screen" nil nil nil
+               "-dmS" session
+               claude-dashboard-program args)
+        ;; 2. Attach via eat — screen owns the PTY; eat is one client.
+        (claude-dashboard--exec-eat buf name "screen"
+                                    (list "-x" session))
+        ;; 3. Remember the session for cleanup + manifest.
+        (puthash buf session claude-dashboard--screen-sessions)))
+     (t
+      (claude-dashboard--exec-eat buf name claude-dashboard-program args)))
     (claude-dashboard--register buf cwd)
+    (claude-dashboard--write-manifest)
     (claude-dashboard--maybe-refresh)
     (pop-to-buffer buf)
     buf))
+
+;;;###autoload
+(defun claude-dashboard-restore ()
+  "Re-attach surviving screen sessions recorded in the manifest.
+Reads `claude-dashboard-manifest-file' and, for each entry whose
+screen session is still running, creates a fresh eat buffer that
+attaches to it via `screen -x'.  Stale entries (sessions that have
+since exited) are silently skipped.  Requires
+`claude-dashboard-multiplexer' to be `screen'."
+  (interactive)
+  (unless (eq claude-dashboard-multiplexer 'screen)
+    (user-error "Set `claude-dashboard-multiplexer' to `screen' first"))
+  (let ((entries (claude-dashboard--read-manifest))
+        (restored 0)
+        (stale 0))
+    (dolist (e entries)
+      (let* ((cwd (plist-get e :cwd))
+             (session (plist-get e :session))
+             (buffer-name (plist-get e :buffer-name)))
+        (cond
+         ((not (claude-dashboard--screen-session-exists-p session))
+          (cl-incf stale))
+         ((cl-some (lambda (i)
+                     (equal (gethash (claude-dashboard-instance-buffer i)
+                                     claude-dashboard--screen-sessions)
+                            session))
+                   (claude-dashboard--instances-list))
+          ;; Already attached by a prior `claude-dashboard-restore' call.
+          nil)
+         (t
+          (let* ((default-directory cwd)
+                 (buf (get-buffer-create
+                       (or (and (not (get-buffer buffer-name)) buffer-name)
+                           (claude-dashboard--unique-buffer-name cwd)))))
+            (claude-dashboard--exec-eat buf (buffer-name buf) "screen"
+                                        (list "-x" session))
+            (puthash buf session claude-dashboard--screen-sessions)
+            (claude-dashboard--register buf cwd)
+            (cl-incf restored))))))
+    (claude-dashboard--write-manifest)
+    (claude-dashboard--maybe-refresh)
+    (message "claude-dashboard: restored %d session(s); %d stale skipped"
+             restored stale)))
 
 ;;;###autoload
 (defun claude-dashboard-new (cwd)
