@@ -977,202 +977,28 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
     inst))
 
 (defun claude-dashboard--on-buffer-killed ()
-  (let ((session (gethash (current-buffer)
-                          claude-dashboard--multiplexer-sessions)))
-    (when session
-      (pcase claude-dashboard-multiplexer
-        ('dtach (claude-dashboard--kill-dtach-session session))))
-    (remhash (current-buffer) claude-dashboard--multiplexer-sessions))
   (remhash (current-buffer) claude-dashboard--instances)
-  (claude-dashboard--write-manifest)
   (claude-dashboard--maybe-refresh))
 
-;;; Multiplexer (dtach) integration
-
-(defcustom claude-dashboard-multiplexer nil
-  "Optional terminal multiplexer wrapping each claude process.
-nil      — direct eat subprocess (default; processes die when emacs exits).
-`dtach'  — each instance runs inside a `dtach -n' session that
-           survives emacs exit; eat attaches via `dtach -a -E -r winch'.
-           `claude-dashboard-restore' on a fresh emacs re-attaches each
-           surviving session.  Requires `dtach' in PATH (a ~50 KB
-           single-purpose binary; smaller and quieter than GNU screen)."
-  :type '(choice (const :tag "Direct (no multiplexer)" nil)
-                 (const :tag "dtach" dtach))
-  :group 'claude-dashboard)
-
-(defcustom claude-dashboard-manifest-file
-  (expand-file-name "dashboard-manifest.el" claude-dashboard-claude-dir)
-  "File where dashboard records each multiplexed instance's metadata.
-Read by `claude-dashboard-restore' on a fresh emacs to re-attach to
-sessions that survived the previous session."
-  :type 'file :group 'claude-dashboard)
-
-(defcustom claude-dashboard-dtach-socket-dir
-  (expand-file-name "claude-dashboard"
-                    (or (getenv "XDG_RUNTIME_DIR")
-                        (expand-file-name ".cache" (getenv "HOME"))))
-  "Directory where dtach socket files are kept.
-Defaults to `$XDG_RUNTIME_DIR/claude-dashboard' (auto-cleaned on
-reboot) when the env var is set, else `~/.cache/claude-dashboard'."
-  :type 'directory :group 'claude-dashboard)
-
-(defvar claude-dashboard--multiplexer-sessions (make-hash-table :test 'eq)
-  "Map buffer → multiplexer session token.
-For dtach the token is the absolute socket path.")
-
-(defun claude-dashboard--dtach-socket-path (cwd)
-  "Generate a unique dtach socket path keyed off CWD's project name."
-  (unless (file-directory-p claude-dashboard-dtach-socket-dir)
-    (make-directory claude-dashboard-dtach-socket-dir t))
-  (expand-file-name
-   (format "%s.%d.sock"
-           (file-name-nondirectory (directory-file-name cwd))
-           (random 1000000))
-   claude-dashboard-dtach-socket-dir))
-
-(defun claude-dashboard--dtach-session-exists-p (socket)
-  "Return non-nil when a dtach process is owning SOCKET."
-  (and socket
-       (file-exists-p socket)
-       (zerop (call-process
-               "sh" nil nil nil "-c"
-               (format "pgrep -f %s >/dev/null"
-                       (shell-quote-argument
-                        (concat "dtach.*" socket)))))))
-
-(defun claude-dashboard--kill-dtach-session (socket)
-  "Kill the dtach process owning SOCKET (and therefore its child)."
-  (when (and socket (file-exists-p socket))
-    (call-process
-     "sh" nil nil nil "-c"
-     (format "pgrep -f %s | xargs -r kill -TERM"
-             (shell-quote-argument (concat "dtach.*" socket))))
-    (ignore-errors (delete-file socket))))
-
-(defun claude-dashboard--exec-eat (buf name program args)
-  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks."
-  (with-current-buffer buf
-    ;; Eat's shell-prompt annotation reserves a one-column left margin.
-    ;; Claude Code is a TUI app, not a shell — the column shifts the
-    ;; whole frame right and clips the right edge of the boxed prompt,
-    ;; producing an apparent extra wrap line.  Disable it before
-    ;; `eat-mode' runs so the margin isn't installed in this buffer.
-    (setq-local eat-enable-shell-prompt-annotation nil)
-    (unless (derived-mode-p 'eat-mode) (eat-mode))
-    (eat-exec buf name program nil args)))
-
-(defun claude-dashboard--write-manifest ()
-  "Persist running multiplexed instances to `claude-dashboard-manifest-file'.
-Each entry is a plist (:cwd :session :buffer-name :recorded).  Direct
-\(non-multiplexed) instances are NOT recorded — they cannot be
-restored after emacs exits anyway."
-  (when (and (memq claude-dashboard-multiplexer '(dtach))
-             claude-dashboard-manifest-file)
-    (let ((entries
-           (cl-loop for inst in (claude-dashboard--instances-list)
-                    for buf = (claude-dashboard-instance-buffer inst)
-                    for session = (gethash buf
-                                            claude-dashboard--multiplexer-sessions)
-                    when session
-                    collect (list :cwd (claude-dashboard-instance-cwd inst)
-                                  :session session
-                                  :buffer-name (buffer-name buf)
-                                  :recorded (current-time)))))
-      (let ((dir (file-name-directory claude-dashboard-manifest-file)))
-        (when (and dir (not (file-directory-p dir)))
-          (make-directory dir t)))
-      (with-temp-file claude-dashboard-manifest-file
-        (insert ";;; -*- lisp-data -*-\n")
-        (let ((print-level nil) (print-length nil))
-          (prin1 entries (current-buffer)))
-        (insert "\n")))))
-
-(defun claude-dashboard--read-manifest ()
-  "Read `claude-dashboard-manifest-file' and return the entry list, or nil."
-  (when (and claude-dashboard-manifest-file
-             (file-readable-p claude-dashboard-manifest-file))
-    (with-temp-buffer
-      (insert-file-contents claude-dashboard-manifest-file)
-      (goto-char (point-min))
-      (ignore-errors (read (current-buffer))))))
-
 (defun claude-dashboard--launch (cwd extra-args)
-  "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer.
-When `claude-dashboard-multiplexer' is `dtach', wraps the process
-in a `dtach -n' session that survives emacs exit; the session's
-socket path is recorded in `claude-dashboard--multiplexer-sessions'
-\(keyed by buffer) and persisted to the manifest file."
+  "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer."
   (let* ((default-directory cwd)
          (name (claude-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (args (append claude-dashboard-program-args extra-args)))
-    (cond
-     ((eq claude-dashboard-multiplexer 'dtach)
-      (let ((socket (claude-dashboard--dtach-socket-path cwd)))
-        ;; 1. Spawn a detached dtach session running claude.
-        ;;    -n: create + run detached + return.
-        ;;    -E: disable detach key (so eat sees all keystrokes).
-        ;;    -r winch: redraw via SIGWINCH on attach (eat sets size).
-        (apply #'call-process "dtach" nil nil nil
-               "-n" socket "-E" "-r" "winch"
-               claude-dashboard-program args)
-        ;; Give dtach a moment to bind the socket.
-        (sleep-for 0.1)
-        ;; 2. Attach via eat — dtach owns the PTY; eat is one client.
-        (claude-dashboard--exec-eat buf name "dtach"
-                                    (list "-a" socket "-E" "-r" "winch"))
-        ;; 3. Remember the socket for cleanup + manifest.
-        (puthash buf socket claude-dashboard--multiplexer-sessions)))
-     (t
-      (claude-dashboard--exec-eat buf name claude-dashboard-program args)))
+    (with-current-buffer buf
+      ;; Eat's shell-prompt annotation reserves a one-column left margin.
+      ;; Claude Code is a TUI app, not a shell — the column shifts the
+      ;; whole frame right and clips the right edge of the boxed prompt,
+      ;; producing an apparent extra wrap line.  Disable it before
+      ;; `eat-mode' runs so the margin isn't installed in this buffer.
+      (setq-local eat-enable-shell-prompt-annotation nil)
+      (unless (derived-mode-p 'eat-mode) (eat-mode))
+      (eat-exec buf name claude-dashboard-program nil args))
     (claude-dashboard--register buf cwd)
-    (claude-dashboard--write-manifest)
     (claude-dashboard--maybe-refresh)
     (pop-to-buffer buf)
     buf))
-
-;;;###autoload
-(defun claude-dashboard-restore ()
-  "Re-attach surviving dtach sessions recorded in the manifest.
-Reads `claude-dashboard-manifest-file' and, for each entry whose
-dtach socket is still owned by a live dtach process, creates a
-fresh eat buffer that attaches via `dtach -a'.  Stale entries are
-silently skipped.  Requires `claude-dashboard-multiplexer' to be
-`dtach'."
-  (interactive)
-  (unless (eq claude-dashboard-multiplexer 'dtach)
-    (user-error "Set `claude-dashboard-multiplexer' to `dtach' first"))
-  (let ((entries (claude-dashboard--read-manifest))
-        (restored 0)
-        (stale 0))
-    (dolist (e entries)
-      (let* ((cwd (plist-get e :cwd))
-             (socket (plist-get e :session))
-             (buffer-name (plist-get e :buffer-name)))
-        (cond
-         ((not (claude-dashboard--dtach-session-exists-p socket))
-          (cl-incf stale))
-         ((cl-some (lambda (i)
-                     (equal (gethash (claude-dashboard-instance-buffer i)
-                                     claude-dashboard--multiplexer-sessions)
-                            socket))
-                   (claude-dashboard--instances-list))
-          nil)
-         (t
-          (let* ((default-directory cwd)
-                 (buf (get-buffer-create
-                       (or (and (not (get-buffer buffer-name)) buffer-name)
-                           (claude-dashboard--unique-buffer-name cwd)))))
-            (claude-dashboard--exec-eat buf (buffer-name buf) "dtach"
-                                        (list "-a" socket "-E" "-r" "winch"))
-            (puthash buf socket claude-dashboard--multiplexer-sessions)
-            (claude-dashboard--register buf cwd)
-            (cl-incf restored))))))
-    (claude-dashboard--write-manifest)
-    (claude-dashboard--maybe-refresh)
-    (message "claude-dashboard: restored %d session(s); %d stale skipped"
-             restored stale)))
 
 ;;;###autoload
 (defun claude-dashboard-new (cwd)

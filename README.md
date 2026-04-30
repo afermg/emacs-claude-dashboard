@@ -7,9 +7,9 @@ bottom of the frame and shows them as a single line each — project tag,
 state, uptime, deploy branch, session id, latest activity, and the
 conversation's name.
 
-By default the dashboard tracks only instances **launched through it**.
-Optional `dtach` integration lets those instances survive an Emacs restart
-and be re-attached on the next launch (see *Process survival* below).
+The dashboard tracks only instances **launched through it**.  Each
+`claude` runs as a direct Emacs subprocess (no multiplexer wrapping)
+and dies when Emacs exits.
 
 ## Install
 
@@ -22,8 +22,7 @@ Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-secti
   :straight (:host github :repo "afermg/emacs-claude-dashboard"
              :files ("claude-dashboard.el"))
   :commands (claude-dashboard claude-dashboard-new
-             claude-dashboard-continue claude-dashboard-resume
-             claude-dashboard-restore))
+             claude-dashboard-continue claude-dashboard-resume))
 ```
 
 With `package-vc-install` (Emacs 29+, no straight.el needed):
@@ -121,76 +120,24 @@ too often and were removed:
 - Expensive lookups (branch name, project name, topic) are cached for
   30 s per instance.
 
-## Process survival (`dtach`)
+### Process lifecycle
 
-By default `claude` runs as an Emacs subprocess and dies when Emacs
-exits. If you want sessions to outlive Emacs restarts, install
-[`dtach`](https://github.com/crigler/dtach) (it's a ~50 KB single-purpose
-binary; on most distros `apt install dtach` / `nix profile install nixpkgs#dtach`)
-and toggle:
-
-```elisp
-(setq claude-dashboard-multiplexer 'dtach)
-```
-
-After this, every new `N` / `b` / `c` / `R` launch wraps `claude` in
-`dtach -n SOCKET -E -r winch`. Eat attaches via `dtach -a SOCKET -E -r winch`,
-becoming one client of the dtach-owned PTY. Killing the eat buffer
-sends `SIGTERM` to the dtach process so the row is fully destructive
-when you mean it to be — but Emacs exit alone leaves dtach alive.
-
-### Manifest + restore
-
-Each multiplexed launch is recorded to a manifest at
-`claude-dashboard-manifest-file` (defaults to
-`~/.claude/dashboard-manifest.el`):
-
-```lisp
-((:cwd "/home/me/projects/aliby/main/"
-  :session "/run/user/1000/claude-dashboard/main.123456.sock"
-  :buffer-name "*claude-aliby-…*"
-  :recorded …)
- …)
-```
-
-After an Emacs restart, `M-x claude-dashboard-restore` reads the manifest,
-filters to entries whose dtach socket is still owned by a live dtach
-process (via `pgrep`), and re-attaches each in a fresh eat buffer. Stale
-entries are silently skipped.
-
-### Working with dtach sockets outside Emacs
-
-The sockets live under `claude-dashboard-dtach-socket-dir`
-(defaults to `$XDG_RUNTIME_DIR/claude-dashboard` or
-`~/.cache/claude-dashboard`).
-
-| What you want | Command |
-| --- | --- |
-| List the dashboard's sessions | `ls -lh "$XDG_RUNTIME_DIR/claude-dashboard/"` |
-| Attach from a regular terminal | `dtach -a /run/user/1000/claude-dashboard/<name>.sock -E -r winch` |
-| Multi-attach (Emacs + tmux pane simultaneously) | Same `dtach -a` from each client; both see the same PTY |
-| Detach without exiting (manual attach) | Run with `-e ^\` and press `Ctrl-\`. (The dashboard launches with `-E`, which disables the detach key, so eat sees every keystroke including `C-\`.) |
-| Find which session a known PID is in | `lsof -p <pid> 2>/dev/null \| grep claude-dashboard` |
-| Launch a brand-new session manually | `dtach -n /tmp/myclaude.sock -E -r winch claude` |
-| Kill a session (and its claude) from the shell | `pgrep -f "dtach.*<socket-path>" \| xargs kill && rm <socket-path>` |
-| Reattach the dashboard to a hand-launched session | Append a plist entry to `~/.claude/dashboard-manifest.el` and `M-x claude-dashboard-restore` |
-
-A typical workflow from a tmux pane: `cd ~/myproj && dtach -A
-/tmp/myclaude.sock -E -r winch claude` (creates if missing, attaches if
-exists). Detach with `Ctrl-\`. Reattach later with `dtach -a /tmp/myclaude.sock
--E -r winch` from any terminal.
+`claude` runs as a direct Emacs subprocess inside an `eat`-allocated
+PTY.  When Emacs exits, the PTY closes and `claude` exits too — there
+is no terminal-multiplexer integration.  Earlier branches experimented
+with both GNU `screen` and `dtach`; neither survived enough of the
+visual artifacts and per-keystroke latency they introduced into eat
+to be worth the survival benefit.  If you need cross-restart
+survival, run `claude` outside Emacs (e.g. inside your own tmux
+session) and use `~/.claude/projects/<slug>/<sid>.jsonl` plus
+`claude --resume <sid>` to pick the conversation back up.
 
 ## Customization
 
 ```elisp
 ;; Process / launch
 (setq claude-dashboard-program "claude"             ;; or absolute path
-      claude-dashboard-program-args nil             ;; extra CLI args
-      claude-dashboard-multiplexer nil              ;; nil or 'dtach
-      claude-dashboard-dtach-socket-dir
-        (expand-file-name "claude-dashboard"
-                          (or (getenv "XDG_RUNTIME_DIR")
-                              (expand-file-name ".cache" (getenv "HOME")))))
+      claude-dashboard-program-args nil)            ;; extra CLI args
 
 ;; Layout
 (setq claude-dashboard-fit-window t                 ;; nil = use default
