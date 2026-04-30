@@ -544,7 +544,8 @@ separators, so e.g. `/home/me/projects/gsk_broad/' becomes
                         (setf (claude-dashboard-instance-model inst) model)
                         (throw 'found nil))))
                   (forward-line 1))))))))
-    (claude-dashboard--retag-buffer inst)))
+    (claude-dashboard--retag-buffer inst)
+    (claude-dashboard--write-manifest)))
 
 ;;; Tool-use extraction (drives the ACTIVITY column + last-exchange body)
 
@@ -974,11 +975,92 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
       (add-hook 'kill-buffer-hook #'claude-dashboard--on-buffer-killed nil t)
       (add-hook 'eat-update-hook #'claude-dashboard--note-activity nil t))
     (run-at-time 2 nil #'claude-dashboard--enrich-instance inst)
+    (claude-dashboard--write-manifest)
     inst))
 
 (defun claude-dashboard--on-buffer-killed ()
   (remhash (current-buffer) claude-dashboard--instances)
+  (claude-dashboard--write-manifest)
   (claude-dashboard--maybe-refresh))
+
+;;; Crash recovery — manifest of running sessions
+
+(defcustom claude-dashboard-manifest-file
+  (expand-file-name "dashboard-manifest.el" claude-dashboard-claude-dir)
+  "File where a snapshot of currently-running sessions is persisted.
+Read by `claude-dashboard-resume-all' to relaunch every session
+that was open before an emacs crash / quit, via
+`claude --resume <sid>'.  Set to nil to disable manifest writes
+entirely."
+  :type '(choice (const :tag "Disabled" nil) file)
+  :group 'claude-dashboard)
+
+(defun claude-dashboard--write-manifest ()
+  "Persist (cwd, sid) for each registered instance to the manifest file.
+Safe to call any number of times; entries without a resolved sid
+are written too (sid = nil) so `--resume-all' can attempt to look
+them up at recovery time, but they're best-effort."
+  (when claude-dashboard-manifest-file
+    (let ((entries
+           (cl-loop for inst in (claude-dashboard--instances-list)
+                    for cwd = (claude-dashboard-instance-cwd inst)
+                    for sid = (or (and (fboundp 'claude-dashboard--live-session-id)
+                                       (claude-dashboard--live-session-id inst))
+                                  (claude-dashboard-instance-session-id inst))
+                    when cwd
+                    collect (list :cwd cwd :sid sid
+                                  :recorded (current-time)))))
+      (let ((dir (file-name-directory claude-dashboard-manifest-file)))
+        (when (and dir (not (file-directory-p dir)))
+          (make-directory dir t)))
+      (with-temp-file claude-dashboard-manifest-file
+        (insert ";;; -*- lisp-data -*-\n")
+        (let ((print-level nil) (print-length nil))
+          (prin1 entries (current-buffer)))
+        (insert "\n")))))
+
+(defun claude-dashboard--read-manifest ()
+  "Read `claude-dashboard-manifest-file' and return the entry list, or nil."
+  (when (and claude-dashboard-manifest-file
+             (file-readable-p claude-dashboard-manifest-file))
+    (with-temp-buffer
+      (insert-file-contents claude-dashboard-manifest-file)
+      (goto-char (point-min))
+      (ignore-errors (read (current-buffer))))))
+
+;;;###autoload
+(defun claude-dashboard-resume-all ()
+  "Relaunch every session in the manifest via `claude --resume <sid>'.
+For each entry (:cwd :sid) in `claude-dashboard-manifest-file':
+- if its cwd is gone, skip;
+- if no sid, skip (nothing to resume);
+- if an instance for that cwd is already running in the dashboard,
+  skip (avoid duplicate launches);
+- otherwise fire `--launch CWD (\"--resume\" SID)'.
+Asks for confirmation before launching so a stale manifest from
+weeks ago doesn't surprise you."
+  (interactive)
+  (let* ((entries (claude-dashboard--read-manifest))
+         (live-cwds (mapcar #'claude-dashboard-instance-cwd
+                            (claude-dashboard--instances-list)))
+         (candidates
+          (cl-loop for e in entries
+                   for cwd = (plist-get e :cwd)
+                   for sid = (plist-get e :sid)
+                   when (and cwd sid
+                             (file-directory-p cwd)
+                             (not (member cwd live-cwds)))
+                   collect (cons cwd sid))))
+    (cond
+     ((null entries)
+      (message "claude-dashboard: manifest is empty (or unreadable)"))
+     ((null candidates)
+      (message "claude-dashboard: nothing to resume (manifest sessions all live, missing, or sid-less)"))
+     ((y-or-n-p (format "Resume %d session(s) from manifest? "
+                        (length candidates)))
+      (dolist (c candidates)
+        (claude-dashboard--launch (car c) (list "--resume" (cdr c))))
+      (message "claude-dashboard: resumed %d session(s)" (length candidates))))))
 
 (defun claude-dashboard--launch (cwd extra-args)
   "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer."
@@ -997,7 +1079,7 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
       (eat-exec buf name claude-dashboard-program nil args))
     (claude-dashboard--register buf cwd)
     (claude-dashboard--maybe-refresh)
-    (pop-to-buffer buf)
+    (pop-to-buffer buf claude-dashboard-instance-window-action)
     buf))
 
 ;;;###autoload
@@ -1088,15 +1170,48 @@ With prefix arg or when called from a row, restrict to that row's cwd."
       (user-error "No Claude instance at point"))
     val))
 
+(defun claude-dashboard--reuse-instance-window (buffer alist)
+  "`display-buffer' action: reuse any window already showing an instance.
+Returns the window after swapping in BUFFER, or nil if no other
+instance buffer is currently displayed.  Pairs naturally with
+`display-buffer-pop-up-window' as a fallback in the action list."
+  (when-let ((win (cl-find-if
+                   (lambda (w)
+                     (let ((b (window-buffer w)))
+                       (and (not (eq b buffer))
+                            (not (eq b (get-buffer
+                                        claude-dashboard-buffer-name)))
+                            (gethash b claude-dashboard--instances))))
+                   (window-list (selected-frame)))))
+    (window--display-buffer buffer win 'reuse alist)
+    win))
+
+(defcustom claude-dashboard-instance-window-action
+  '((claude-dashboard--reuse-instance-window
+     display-buffer-pop-up-window)
+    (inhibit-same-window . nil))
+  "Display action for popping into an instance buffer.
+The default reuses any window currently showing another dashboard
+instance (so only one agent is visible at a time and switching
+agents replaces the visible buffer in place); falls back to
+opening a new window when no instance is shown yet."
+  :type 'sexp :group 'claude-dashboard)
+
 (defun claude-dashboard-visit (inst)
-  "Pop to INST's eat buffer."
+  "Pop to INST's eat buffer.
+Reuses the window currently showing another instance, so visiting
+a second agent replaces the first one in place rather than piling
+up windows.  See `claude-dashboard-instance-window-action'."
   (interactive (list (claude-dashboard--current-instance)))
-  (pop-to-buffer (claude-dashboard-instance-buffer inst)))
+  (pop-to-buffer (claude-dashboard-instance-buffer inst)
+                 claude-dashboard-instance-window-action))
 
 (defun claude-dashboard-display (inst)
-  "Display INST's eat buffer in another window without selecting it."
+  "Display INST's eat buffer without selecting it.
+Reuses an existing instance window if one is visible."
   (interactive (list (claude-dashboard--current-instance)))
-  (display-buffer (claude-dashboard-instance-buffer inst)))
+  (display-buffer (claude-dashboard-instance-buffer inst)
+                  claude-dashboard-instance-window-action))
 
 (defun claude-dashboard-dired (inst)
   "Open INST's project root in dired."
@@ -1694,6 +1809,9 @@ on; nil otherwise (so `display-buffer' uses default rules)."
   ;; chance to land in the transcript before the topic resolver reads it.
   (dolist (inst (claude-dashboard--instances-list))
     (ignore-errors (claude-dashboard--maybe-auto-name inst)))
+  ;; Heartbeat: keep the crash-recovery manifest current so a sudden
+  ;; emacs exit leaves a usable snapshot for `claude-dashboard-resume-all'.
+  (ignore-errors (claude-dashboard--write-manifest))
   (let ((buf (get-buffer claude-dashboard-buffer-name)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
