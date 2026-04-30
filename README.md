@@ -123,14 +123,14 @@ too often and were removed:
 ### Process lifecycle
 
 `claude` runs as a direct Emacs subprocess inside an `eat`-allocated
-PTY.  When Emacs exits, the PTY closes and `claude` exits too — there
-is no terminal-multiplexer integration.  Earlier branches experimented
-with both GNU `screen` and `dtach`; neither survived enough of the
-visual artifacts and per-keystroke latency they introduced into eat
-to be worth the survival benefit.  If you need cross-restart
-survival, run `claude` outside Emacs (e.g. inside your own tmux
-session) and use `~/.claude/projects/<slug>/<sid>.jsonl` plus
-`claude --resume <sid>` to pick the conversation back up.
+PTY.  When Emacs exits, the PTY closes and `claude` exits too —
+there is no terminal-multiplexer integration.  Earlier branches
+experimented with both GNU `screen` and `dtach`; neither survived
+enough of the visual artifacts and per-keystroke latency they
+introduced into eat to be worth the survival benefit.  If you need
+to pick a conversation back up after restart, the per-session
+transcripts live at `~/.claude/projects/<slug>/<sid>.jsonl` and
+`claude --resume <sid>` works on a fresh launch.
 
 ## Customization
 
