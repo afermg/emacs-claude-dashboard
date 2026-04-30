@@ -312,6 +312,179 @@ Match anywhere in the tail means the agent is actively working
 \(generating tokens or running a tool); absence means it's idle."
   :type 'regexp :group 'claude-dashboard)
 
+;;; --- Session-kind classification (monitor vs code) ----------------------
+;;
+;; This is *session-level*, not moment-level: we ask "does this agent's
+;; purpose look like polling a background process?" by mining the
+;; per-session transcript on disk.  Independent of RUN/IDL/EXT — a
+;; running session and an idle session can both be `monitor'-kind.
+;;
+;; Four features, each contributes 1 to a 0–4 score; >=2 → `monitor'.
+;;
+;;   1. ScheduleWakeup-tool rate (per assistant turn) > 0.010
+;;   2. Polling-bash fraction > 7%   (verbs in `claude-dashboard-monitor-bash-verbs')
+;;   3. Assistant-prose fraction starting with monitoring verbs > 1%
+;;   4. File-ops (Edit/Read/Write) fraction < 30%
+;;
+;; Verified against labelled examples: `aliby-ts-monitor' scores 4/4,
+;; this very session scores 0/4.
+
+(defcustom claude-dashboard-classify-min-turns 20
+  "Minimum assistant turns before a session is eligible for kind classification.
+Below this, `claude-dashboard--classify-kind' returns nil so a
+brand-new session isn't labelled prematurely."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-kind-cache-ttl 300
+  "Seconds a session-kind verdict is cached before recomputation.
+The classifier reads megabytes of transcript so cannot run on every
+5-second refresh; classification changes slowly so 5 minutes is fine."
+  :type 'integer :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitor-bash-verbs
+  '("ps" "pgrep" "pidof" "tail" "sleep" "watch" "screen" "kill"
+    "free" "df" "top" "nvidia-smi" "rocm-smi" "htop" "journalctl"
+    "systemctl" "ping" "tmux")
+  "Bash verbs treated as polling/monitoring for the kind classifier.
+Match is on the first non-prefix verb of the command (after any
+leading `cd …;' / `&&' / env-var assignments are stripped)."
+  :type '(repeat string) :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitor-prose-regexp
+  "\\`\\(?:Sleeping\\|Waiting\\|Continuing\\|Still\\|Monitor\\|Polling\\|Watching\\)\\b"
+  "Regexp matched against the leading word of an assistant text item.
+Each match contributes to the monitor-prose fraction feature."
+  :type 'regexp :group 'claude-dashboard)
+
+(defcustom claude-dashboard-classify-thresholds
+  '((wakeup-rate       . 0.010)
+    (polling-frac      . 0.07)
+    (prose-frac        . 0.01)
+    (file-ops-frac-max . 0.30))
+  "Per-feature thresholds for the session-kind score.
+Each threshold met contributes 1 to a 0–4 score; the verdict is
+`monitor' iff score >= 2.  See the commentary above
+`claude-dashboard-classify-min-turns' for the four features."
+  :type '(alist :key-type symbol :value-type number)
+  :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitor-color "#36c0c0"
+  "Foreground color of the monitor-kind glyph in the project cell."
+  :type 'color :group 'claude-dashboard)
+
+(defcustom claude-dashboard-monitor-glyph "↻"
+  "Glyph prepended to the project cell of monitor-kind rows."
+  :type 'string :group 'claude-dashboard)
+
+(defvar claude-dashboard--kind-cache (make-hash-table :test 'equal)
+  "Map sid (string) → (KIND . FLOAT-TIME).  KIND is `monitor', `code', or nil.")
+
+(defun claude-dashboard--bash-first-verb (cmd)
+  "Return the first non-prefix verb of bash CMD, or nil."
+  (when (stringp cmd)
+    (let ((stripped (replace-regexp-in-string
+                     ;; Strip leading `cd <path>;' / `cd <path> &&' /
+                     ;; `FOO=bar BAZ=qux ' env-var assignments.
+                     "\\`\\(?:[ \t]*\\(?:cd[ \t]+[^ \t;&|]+[ \t]*\\(?:&&\\|;\\)\\|[A-Z_]+=[^ \t]+\\)[ \t]*\\)+"
+                     "" cmd)))
+      (car (split-string stripped "[ \t\n]+" t)))))
+
+(defun claude-dashboard--classify-kind (cwd sid)
+  "Return `monitor', `code', or nil for SID's transcript at CWD."
+  (when-let ((file (claude-dashboard--transcript-file-for-sid sid cwd)))
+    (let ((assistant-turns 0)
+          (tool-uses 0)
+          (wakeups 0)
+          (file-ops 0)
+          (bash-cmds 0)
+          (polling-cmds 0)
+          (prose-prefixes 0))
+      (claude-dashboard--map-jsonl-entries
+       file
+       (lambda (entry)
+         (when (equal "assistant" (alist-get 'type entry))
+           (cl-incf assistant-turns)
+           (let ((content (alist-get 'content (alist-get 'message entry))))
+             (when (listp content)
+               (dolist (c content)
+                 (let ((ctype (alist-get 'type c)))
+                   (cond
+                    ((equal ctype "text")
+                     (let ((txt (alist-get 'text c)))
+                       (when (and txt
+                                  (string-match-p
+                                   claude-dashboard-monitor-prose-regexp
+                                   (string-trim txt)))
+                         (cl-incf prose-prefixes))))
+                    ((equal ctype "tool_use")
+                     (cl-incf tool-uses)
+                     (let ((name (alist-get 'name c)))
+                       (cond
+                        ((equal name "ScheduleWakeup") (cl-incf wakeups))
+                        ((member name '("Edit" "Read" "Write" "MultiEdit"
+                                        "NotebookEdit"))
+                         (cl-incf file-ops))
+                        ((equal name "Bash")
+                         (cl-incf bash-cmds)
+                         (let ((verb (claude-dashboard--bash-first-verb
+                                      (alist-get 'command
+                                                 (alist-get 'input c)))))
+                           (when (member verb
+                                         claude-dashboard-monitor-bash-verbs)
+                             (cl-incf polling-cmds)))))))))))))
+         nil)
+       nil nil)
+      (cond
+       ((or (< assistant-turns claude-dashboard-classify-min-turns)
+            (< tool-uses 10))
+        nil)
+       (t
+        (let* ((th claude-dashboard-classify-thresholds)
+               (wakeup-rate (/ (float wakeups) (max 1 assistant-turns)))
+               (polling-frac (if (zerop bash-cmds) 0.0
+                               (/ (float polling-cmds) bash-cmds)))
+               (prose-frac (/ (float prose-prefixes)
+                              (max 1 assistant-turns)))
+               (file-ops-frac (if (zerop tool-uses) 0.0
+                                (/ (float file-ops) tool-uses)))
+               (score (+ (if (> wakeup-rate
+                                (alist-get 'wakeup-rate th)) 1 0)
+                         (if (> polling-frac
+                                (alist-get 'polling-frac th)) 1 0)
+                         (if (> prose-frac
+                                (alist-get 'prose-frac th)) 1 0)
+                         (if (< file-ops-frac
+                                (alist-get 'file-ops-frac-max th)) 1 0))))
+          (if (>= score 2) 'monitor 'code)))))))
+
+(defun claude-dashboard--instance-kind (inst)
+  "Return INST's session kind (`monitor' or `code'), cached.
+Returns nil for sessions with insufficient data."
+  (when-let* ((sid (or (claude-dashboard--live-session-id inst)
+                       (claude-dashboard-instance-session-id inst))))
+    (let ((cur (gethash sid claude-dashboard--kind-cache))
+          (now (float-time)))
+      (if (and cur (< (- now (cdr cur))
+                      claude-dashboard-kind-cache-ttl))
+          (car cur)
+        (let ((kind (claude-dashboard--classify-kind
+                     (claude-dashboard-instance-cwd inst) sid)))
+          (puthash sid (cons kind now) claude-dashboard--kind-cache)
+          kind)))))
+
+(defun claude-dashboard-reclassify-instance ()
+  "Force a fresh kind classification for the row at point.
+Useful after an agent's purpose has shifted (e.g. a coding session
+that started polling after finishing the bug fix)."
+  (interactive)
+  (let* ((inst (claude-dashboard--current-instance))
+         (sid (or (claude-dashboard--live-session-id inst)
+                  (claude-dashboard-instance-session-id inst))))
+    (when sid (remhash sid claude-dashboard--kind-cache))
+    (let ((kind (claude-dashboard--instance-kind inst)))
+      (claude-dashboard--maybe-refresh)
+      (message "claude-dashboard: kind = %s" (or kind "(undetermined)")))))
+
 (defun claude-dashboard--status (inst)
   "Return INST's current phase symbol: `exited', `running', or `idle'."
   (let ((proc (claude-dashboard--instance-process inst)))
@@ -979,6 +1152,9 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
     inst))
 
 (defun claude-dashboard--on-buffer-killed ()
+  (when-let ((inst (gethash (current-buffer) claude-dashboard--instances))
+             (sid (claude-dashboard-instance-session-id inst)))
+    (remhash sid claude-dashboard--kind-cache))
   (remhash (current-buffer) claude-dashboard--instances)
   (claude-dashboard--write-manifest)
   (claude-dashboard--maybe-refresh))
@@ -1642,16 +1818,32 @@ segment intact, elides intermediate components with `…/'."
          (sid (or (and sid-full (substring sid-full 0 8)) "—"))
          (activity-cell
           (truncate-string-to-width
-           (claude-dashboard--activity-cell cwd sid-full) 24 nil ?\s "…")))
+           (claude-dashboard--activity-cell cwd sid-full) 24 nil ?\s "…"))
+         ;; Session-kind annotation: if the classifier says this row is
+         ;; a monitor session, prepend `↻ ' to the project name (and
+         ;; shrink its truncate budget by 2 so the column width stays
+         ;; the same).
+         (kind (claude-dashboard--instance-kind inst))
+         (kind-prefix (if (eq kind 'monitor)
+                          (concat
+                           (propertize claude-dashboard-monitor-glyph
+                                       'face `(:foreground ,claude-dashboard-monitor-color
+                                                           :weight bold))
+                           " ")
+                        ""))
+         (proj-budget (- claude-dashboard-project-max-width
+                         (length kind-prefix))))
     (format (claude-dashboard--row-format branch-w topic-w)
             (if (gethash (claude-dashboard-instance-buffer inst)
                          claude-dashboard--marks)
                 (propertize "*" 'face 'warning)
               " ")
             glyph
-            (propertize (truncate-string-to-width
-                         proj claude-dashboard-project-max-width nil ?\s "…")
-                        'face `(:foreground ,root-color :weight bold))
+            (concat
+             kind-prefix
+             (propertize (truncate-string-to-width
+                          proj proj-budget nil ?\s "…")
+                         'face `(:foreground ,root-color :weight bold)))
             (propertize (claude-dashboard--state-abbrev status)
                         'face (claude-dashboard--state-face status))
             uptime
