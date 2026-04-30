@@ -1698,10 +1698,11 @@ second line on narrower windows."
       (claude-dashboard--instance-branch inst)
       "—"))
 
-(defun claude-dashboard--state-abbrev (status)
+(defun claude-dashboard--state-abbrev (status &optional kind)
+  "Abbreviate STATUS.  When KIND is `monitor', `idle' is shown as MON."
   (pcase status
     ('running "RUN")
-    ('idle    "IDL")
+    ('idle    (if (eq kind 'monitor) "MON" "IDL"))
     ('exited  "EXT")
     (_        "?")))
 
@@ -1844,8 +1845,11 @@ segment intact, elides intermediate components with `…/'."
              (propertize (truncate-string-to-width
                           proj proj-budget nil ?\s "…")
                          'face `(:foreground ,root-color :weight bold)))
-            (propertize (claude-dashboard--state-abbrev status)
-                        'face (claude-dashboard--state-face status))
+            (propertize (claude-dashboard--state-abbrev status kind)
+                        'face (if (and (eq status 'idle) (eq kind 'monitor))
+                                  `(:foreground ,claude-dashboard-monitor-color
+                                                :weight bold)
+                                (claude-dashboard--state-face status)))
             uptime
             (truncate-string-to-width branch branch-w nil ?\s "…")
             sid
