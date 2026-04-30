@@ -978,67 +978,80 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
 
 (defun claude-dashboard--on-buffer-killed ()
   (let ((session (gethash (current-buffer)
-                          claude-dashboard--screen-sessions)))
-    (claude-dashboard--kill-screen-session session)
-    (remhash (current-buffer) claude-dashboard--screen-sessions))
+                          claude-dashboard--multiplexer-sessions)))
+    (when session
+      (pcase claude-dashboard-multiplexer
+        ('dtach (claude-dashboard--kill-dtach-session session))))
+    (remhash (current-buffer) claude-dashboard--multiplexer-sessions))
   (remhash (current-buffer) claude-dashboard--instances)
   (claude-dashboard--write-manifest)
   (claude-dashboard--maybe-refresh))
 
-;;; Multiplexer (GNU screen) integration
+;;; Multiplexer (dtach) integration
 
 (defcustom claude-dashboard-multiplexer nil
   "Optional terminal multiplexer wrapping each claude process.
 nil      — direct eat subprocess (default; processes die when emacs exits).
-`screen' — each instance runs inside a detached GNU screen session;
-           eat attaches via `screen -x'.  The session survives emacs
-           exit, so `claude-dashboard-restore' on a fresh emacs can
-           re-attach to all surviving claudes.  Requires the `screen'
-           binary to be in PATH."
+`dtach'  — each instance runs inside a `dtach -n' session that
+           survives emacs exit; eat attaches via `dtach -a -E -r winch'.
+           `claude-dashboard-restore' on a fresh emacs re-attaches each
+           surviving session.  Requires `dtach' in PATH (a ~50 KB
+           single-purpose binary; smaller and quieter than GNU screen)."
   :type '(choice (const :tag "Direct (no multiplexer)" nil)
-                 (const :tag "GNU screen" screen))
+                 (const :tag "dtach" dtach))
   :group 'claude-dashboard)
 
 (defcustom claude-dashboard-manifest-file
   (expand-file-name "dashboard-manifest.el" claude-dashboard-claude-dir)
   "File where dashboard records each multiplexed instance's metadata.
 Read by `claude-dashboard-restore' on a fresh emacs to re-attach to
-screen sessions that survived the previous session."
+sessions that survived the previous session."
   :type 'file :group 'claude-dashboard)
 
-(defvar claude-dashboard--screen-sessions (make-hash-table :test 'eq)
-  "Map buffer → screen-session-name (string) for multiplexed instances.")
+(defcustom claude-dashboard-dtach-socket-dir
+  (expand-file-name "claude-dashboard"
+                    (or (getenv "XDG_RUNTIME_DIR")
+                        (expand-file-name ".cache" (getenv "HOME"))))
+  "Directory where dtach socket files are kept.
+Defaults to `$XDG_RUNTIME_DIR/claude-dashboard' (auto-cleaned on
+reboot) when the env var is set, else `~/.cache/claude-dashboard'."
+  :type 'directory :group 'claude-dashboard)
 
-(defun claude-dashboard--screen-session-name (cwd)
-  "Generate a unique screen session name keyed off CWD's project name."
-  (format "claude-dashboard.%s.%d"
-          (file-name-nondirectory (directory-file-name cwd))
-          (random 1000000)))
+(defvar claude-dashboard--multiplexer-sessions (make-hash-table :test 'eq)
+  "Map buffer → multiplexer session token.
+For dtach the token is the absolute socket path.")
 
-(defun claude-dashboard--screen-session-exists-p (name)
-  "Return non-nil when a screen session NAME is currently running."
-  (and name
-       (zerop (call-process "screen" nil nil nil
-                            "-S" name "-Q" "select" "."))))
+(defun claude-dashboard--dtach-socket-path (cwd)
+  "Generate a unique dtach socket path keyed off CWD's project name."
+  (unless (file-directory-p claude-dashboard-dtach-socket-dir)
+    (make-directory claude-dashboard-dtach-socket-dir t))
+  (expand-file-name
+   (format "%s.%d.sock"
+           (file-name-nondirectory (directory-file-name cwd))
+           (random 1000000))
+   claude-dashboard-dtach-socket-dir))
 
-(defun claude-dashboard--kill-screen-session (name)
-  "Terminate screen session NAME, if any."
-  (when (claude-dashboard--screen-session-exists-p name)
-    (call-process "screen" nil nil nil "-S" name "-X" "quit")))
+(defun claude-dashboard--dtach-session-exists-p (socket)
+  "Return non-nil when a dtach process is owning SOCKET."
+  (and socket
+       (file-exists-p socket)
+       (zerop (call-process
+               "sh" nil nil nil "-c"
+               (format "pgrep -f %s >/dev/null"
+                       (shell-quote-argument
+                        (concat "dtach.*" socket)))))))
 
-(defcustom claude-dashboard-screen-term "xterm-256color"
-  "TERM value to use when attaching to a screen session via eat.
-Eat's default `eat-256color' has a `clear' terminfo entry GNU
-screen rejects (\"Clear screen capability required\"), so the
-screen-attach path must override TERM.  `xterm-256color' is the
-safest universally-installed value."
-  :type 'string :group 'claude-dashboard)
+(defun claude-dashboard--kill-dtach-session (socket)
+  "Kill the dtach process owning SOCKET (and therefore its child)."
+  (when (and socket (file-exists-p socket))
+    (call-process
+     "sh" nil nil nil "-c"
+     (format "pgrep -f %s | xargs -r kill -TERM"
+             (shell-quote-argument (concat "dtach.*" socket))))
+    (ignore-errors (delete-file socket))))
 
-(defun claude-dashboard--exec-eat (buf name program args &optional term)
-  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks.
-When TERM is non-nil, override `eat-term-name' buffer-locally
-before eat-exec runs — required for `screen -x' since screen
-rejects eat's default TERM (\"Clear screen capability required\")."
+(defun claude-dashboard--exec-eat (buf name program args)
+  "Run PROGRAM ARGS inside eat in BUF, with the dashboard's tweaks."
   (with-current-buffer buf
     ;; Eat's shell-prompt annotation reserves a one-column left margin.
     ;; Claude Code is a TUI app, not a shell — the column shifts the
@@ -1047,10 +1060,6 @@ rejects eat's default TERM (\"Clear screen capability required\")."
     ;; `eat-mode' runs so the margin isn't installed in this buffer.
     (setq-local eat-enable-shell-prompt-annotation nil)
     (unless (derived-mode-p 'eat-mode) (eat-mode))
-    ;; Must be set AFTER `eat-mode' — its initialiser resets
-    ;; `eat-term-name' to its defcustom default.
-    (when (and term (boundp 'eat-term-name))
-      (setq-local eat-term-name term))
     (eat-exec buf name program nil args)))
 
 (defun claude-dashboard--write-manifest ()
@@ -1058,13 +1067,13 @@ rejects eat's default TERM (\"Clear screen capability required\")."
 Each entry is a plist (:cwd :session :buffer-name :recorded).  Direct
 \(non-multiplexed) instances are NOT recorded — they cannot be
 restored after emacs exits anyway."
-  (when (and (eq claude-dashboard-multiplexer 'screen)
+  (when (and (memq claude-dashboard-multiplexer '(dtach))
              claude-dashboard-manifest-file)
     (let ((entries
            (cl-loop for inst in (claude-dashboard--instances-list)
                     for buf = (claude-dashboard-instance-buffer inst)
                     for session = (gethash buf
-                                            claude-dashboard--screen-sessions)
+                                            claude-dashboard--multiplexer-sessions)
                     when session
                     collect (list :cwd (claude-dashboard-instance-cwd inst)
                                   :session session
@@ -1090,28 +1099,31 @@ restored after emacs exits anyway."
 
 (defun claude-dashboard--launch (cwd extra-args)
   "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer.
-When `claude-dashboard-multiplexer' is `screen', wraps the process
-in a detached GNU screen session that survives emacs exit; the
-session's name is recorded in `claude-dashboard--screen-sessions'
+When `claude-dashboard-multiplexer' is `dtach', wraps the process
+in a `dtach -n' session that survives emacs exit; the session's
+socket path is recorded in `claude-dashboard--multiplexer-sessions'
 \(keyed by buffer) and persisted to the manifest file."
   (let* ((default-directory cwd)
          (name (claude-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (args (append claude-dashboard-program-args extra-args)))
     (cond
-     ((eq claude-dashboard-multiplexer 'screen)
-      (let ((session (claude-dashboard--screen-session-name cwd)))
-        ;; 1. Spawn a detached screen session running claude.
-        (apply #'call-process "screen" nil nil nil
-               "-dmS" session
+     ((eq claude-dashboard-multiplexer 'dtach)
+      (let ((socket (claude-dashboard--dtach-socket-path cwd)))
+        ;; 1. Spawn a detached dtach session running claude.
+        ;;    -n: create + run detached + return.
+        ;;    -E: disable detach key (so eat sees all keystrokes).
+        ;;    -r winch: redraw via SIGWINCH on attach (eat sets size).
+        (apply #'call-process "dtach" nil nil nil
+               "-n" socket "-E" "-r" "winch"
                claude-dashboard-program args)
-        ;; 2. Attach via eat — screen owns the PTY; eat is one client.
-        ;; TERM override required: see `claude-dashboard-screen-term'.
-        (claude-dashboard--exec-eat buf name "screen"
-                                    (list "-x" session)
-                                    claude-dashboard-screen-term)
-        ;; 3. Remember the session for cleanup + manifest.
-        (puthash buf session claude-dashboard--screen-sessions)))
+        ;; Give dtach a moment to bind the socket.
+        (sleep-for 0.1)
+        ;; 2. Attach via eat — dtach owns the PTY; eat is one client.
+        (claude-dashboard--exec-eat buf name "dtach"
+                                    (list "-a" socket "-E" "-r" "winch"))
+        ;; 3. Remember the socket for cleanup + manifest.
+        (puthash buf socket claude-dashboard--multiplexer-sessions)))
      (t
       (claude-dashboard--exec-eat buf name claude-dashboard-program args)))
     (claude-dashboard--register buf cwd)
@@ -1122,41 +1134,39 @@ session's name is recorded in `claude-dashboard--screen-sessions'
 
 ;;;###autoload
 (defun claude-dashboard-restore ()
-  "Re-attach surviving screen sessions recorded in the manifest.
+  "Re-attach surviving dtach sessions recorded in the manifest.
 Reads `claude-dashboard-manifest-file' and, for each entry whose
-screen session is still running, creates a fresh eat buffer that
-attaches to it via `screen -x'.  Stale entries (sessions that have
-since exited) are silently skipped.  Requires
-`claude-dashboard-multiplexer' to be `screen'."
+dtach socket is still owned by a live dtach process, creates a
+fresh eat buffer that attaches via `dtach -a'.  Stale entries are
+silently skipped.  Requires `claude-dashboard-multiplexer' to be
+`dtach'."
   (interactive)
-  (unless (eq claude-dashboard-multiplexer 'screen)
-    (user-error "Set `claude-dashboard-multiplexer' to `screen' first"))
+  (unless (eq claude-dashboard-multiplexer 'dtach)
+    (user-error "Set `claude-dashboard-multiplexer' to `dtach' first"))
   (let ((entries (claude-dashboard--read-manifest))
         (restored 0)
         (stale 0))
     (dolist (e entries)
       (let* ((cwd (plist-get e :cwd))
-             (session (plist-get e :session))
+             (socket (plist-get e :session))
              (buffer-name (plist-get e :buffer-name)))
         (cond
-         ((not (claude-dashboard--screen-session-exists-p session))
+         ((not (claude-dashboard--dtach-session-exists-p socket))
           (cl-incf stale))
          ((cl-some (lambda (i)
                      (equal (gethash (claude-dashboard-instance-buffer i)
-                                     claude-dashboard--screen-sessions)
-                            session))
+                                     claude-dashboard--multiplexer-sessions)
+                            socket))
                    (claude-dashboard--instances-list))
-          ;; Already attached by a prior `claude-dashboard-restore' call.
           nil)
          (t
           (let* ((default-directory cwd)
                  (buf (get-buffer-create
                        (or (and (not (get-buffer buffer-name)) buffer-name)
                            (claude-dashboard--unique-buffer-name cwd)))))
-            (claude-dashboard--exec-eat buf (buffer-name buf) "screen"
-                                        (list "-x" session)
-                                        claude-dashboard-screen-term)
-            (puthash buf session claude-dashboard--screen-sessions)
+            (claude-dashboard--exec-eat buf (buffer-name buf) "dtach"
+                                        (list "-a" socket "-E" "-r" "winch"))
+            (puthash buf socket claude-dashboard--multiplexer-sessions)
             (claude-dashboard--register buf cwd)
             (cl-incf restored))))))
     (claude-dashboard--write-manifest)
