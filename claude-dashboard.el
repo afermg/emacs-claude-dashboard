@@ -1688,8 +1688,7 @@ TOPIC is the trailing column and is rendered with `%s' so short
 topics don't pad with trailing spaces — that padding could push
 the visible row past the window's right edge and wrap to a
 second line on narrower windows."
-  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-24s  %%s"
-          claude-dashboard-project-max-width branch-w))
+  (format "%%s %%s %%-3s %%5s %%-%ds %%-8s %%-24s  %%s" branch-w))
 
 (defun claude-dashboard--instance-deploy-branch (inst)
   "Return the branch INST was deployed against, falling back to live."
@@ -1785,25 +1784,30 @@ segment intact, elides intermediate components with `…/'."
   "Return the column header line, faced as a section heading."
   (propertize
    (format (claude-dashboard--row-format branch-w topic-w)
-           " " " " "PROJECT" "ST" "UP" "BRANCH"
+           " " " " "ST" "UP" "BRANCH"
            "SESSION" "ACTIVITY" "TOPIC")
    'face 'magit-section-heading))
 
 (defun claude-dashboard--format-instance-line (inst branch-w topic-w)
   "Return a formatted single-line summary for INST."
   (let* ((status (claude-dashboard--status inst))
-         (glyph (claude-dashboard--status-glyph status))
          (cwd (claude-dashboard-instance-cwd inst))
-         (proj (claude-dashboard--cached
-                :project-name inst
-                (lambda ()
-                  (claude-dashboard--project-name cwd))))
+         (kind (claude-dashboard--instance-kind inst))
+         ;; The status glyph used to share the row with a separate PROJECT
+         ;; column.  PROJECT is now removed; tint the glyph by the group
+         ;; root's color when this row is a monitor session, so the visual
+         ;; group cue isn't lost entirely.
          (root (claude-dashboard--cached
                 :main-worktree inst
-                (lambda ()
-                  (claude-dashboard--main-worktree
-                   (claude-dashboard-instance-cwd inst)))))
+                (lambda () (claude-dashboard--main-worktree cwd))))
          (root-color (claude-dashboard--group-color root))
+         (glyph (if (eq kind 'monitor)
+                    (propertize claude-dashboard-monitor-glyph
+                                'face `(:foreground ,claude-dashboard-monitor-color
+                                                    :weight bold))
+                  (propertize "●"
+                              'face `(:foreground ,(claude-dashboard--state-color status)
+                                                  :weight bold))))
          (uptime (claude-dashboard--humanize-duration
                   (- (float-time)
                      (claude-dashboard-instance-started-at inst))))
@@ -1820,31 +1824,17 @@ segment intact, elides intermediate components with `…/'."
          (activity-cell
           (truncate-string-to-width
            (claude-dashboard--activity-cell cwd sid-full) 24 nil ?\s "…"))
-         ;; Session-kind annotation: if the classifier says this row is
-         ;; a monitor session, prepend `↻ ' to the project name (and
-         ;; shrink its truncate budget by 2 so the column width stays
-         ;; the same).
-         (kind (claude-dashboard--instance-kind inst))
-         (kind-prefix (if (eq kind 'monitor)
-                          (concat
-                           (propertize claude-dashboard-monitor-glyph
-                                       'face `(:foreground ,claude-dashboard-monitor-color
-                                                           :weight bold))
-                           " ")
-                        ""))
-         (proj-budget (- claude-dashboard-project-max-width
-                         (length kind-prefix))))
+         ;; Tint the topic by the group root color so the visual grouping
+         ;; that PROJECT used to provide is preserved.
+         (topic-tinted (propertize
+                        (truncate-string-to-width topic topic-w nil nil "…")
+                        'face `(:foreground ,root-color :weight bold))))
     (format (claude-dashboard--row-format branch-w topic-w)
             (if (gethash (claude-dashboard-instance-buffer inst)
                          claude-dashboard--marks)
                 (propertize "*" 'face 'warning)
               " ")
             glyph
-            (concat
-             kind-prefix
-             (propertize (truncate-string-to-width
-                          proj proj-budget nil ?\s "…")
-                         'face `(:foreground ,root-color :weight bold)))
             (propertize (claude-dashboard--state-abbrev status kind)
                         'face (if (and (eq status 'idle) (eq kind 'monitor))
                                   `(:foreground ,claude-dashboard-monitor-color
@@ -1854,9 +1844,7 @@ segment intact, elides intermediate components with `…/'."
             (truncate-string-to-width branch branch-w nil ?\s "…")
             sid
             activity-cell
-            ;; No padding char — keep the row's printed length equal
-            ;; to its actual content so it never overflows the window.
-            (truncate-string-to-width topic topic-w nil nil "…"))))
+            topic-tinted)))
 
 (defcustom claude-dashboard-exchange-text-width 110
   "Hard cap on the rendered width of a single line in the body."
