@@ -261,10 +261,17 @@ renames buffers on `/name', so they're unstable identifiers."
           (message "claude-dashboard: %s busy; deferring scheduled send %ds"
                    (buffer-name (claude-dashboard-instance-buffer inst))
                    claude-dashboard-pending-send-defer-when-busy))
+         ;; Send it.  Claude Code's TUI batches a single PTY read into
+         ;; one logical input event — "text\r" or "text\n" arrive as one
+         ;; chunk and get treated as typed text with embedded CR/LF, NOT
+         ;; as Enter.  To trigger submission we send the body first,
+         ;; give Claude a moment to consume that read, then send a lone
+         ;; CR in a separate PTY write.  Empirically ~50ms is enough.
          (t
           (process-send-string
-           proc
-           (concat (claude-dashboard-pending-send-message p) "\n"))
+           proc (claude-dashboard-pending-send-message p))
+          (sit-for 0.05)
+          (process-send-string proc "\r")
           (remhash id claude-dashboard--pending-sends)
           (claude-dashboard--write-pending-sends)
           (message "claude-dashboard: delivered scheduled send to %s"
