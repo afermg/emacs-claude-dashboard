@@ -793,6 +793,141 @@ Idempotent within an Emacs session.  Past-due entries fire immediately."
         (special-mode))
       (display-buffer buf))))
 
+;;; --- Self-test (smoke test the full schedule + send pipeline) -------------
+
+(defcustom claude-dashboard-schedule-self-test-cwd "/tmp/claude-schedule-selftest"
+  "Disposable directory used by `claude-dashboard-schedule-self-test'.
+Created if missing.  The directory is left in place after the test so
+the spawned instance has a stable cwd; remove it manually if you don't
+want it lingering."
+  :type 'directory
+  :group 'claude-dashboard)
+
+(defcustom claude-dashboard-schedule-self-test-prompt
+  "say hello world and nothing else"
+  "Prompt sent to the disposable instance during the self-test.
+Should be something that produces a deterministic, easy-to-verify
+response — anything containing the literal `hello world' satisfies the
+default success matcher."
+  :type 'string
+  :group 'claude-dashboard)
+
+(defcustom claude-dashboard-schedule-self-test-success-regexp "hello world"
+  "Regex matched against the disposable instance's buffer tail.
+Match → the schedule + launch + initial-message + submit pipeline is
+working end-to-end.  Customize alongside
+`claude-dashboard-schedule-self-test-prompt' if you change one."
+  :type 'regexp
+  :group 'claude-dashboard)
+
+;;;###autoload
+(defun claude-dashboard-schedule-self-test (&optional keep)
+  "End-to-end smoke test of the schedule pipeline.
+
+Schedules a launch in `claude-dashboard-schedule-self-test-cwd' to
+fire in 3 seconds, with
+`claude-dashboard-schedule-self-test-prompt' as the initial message.
+Waits for the launch + the followup-delay + a few seconds for the
+agent's response, then matches
+`claude-dashboard-schedule-self-test-success-regexp' against the
+disposable instance's buffer tail.  Reports pass/fail in the echo
+area and pops a results buffer for inspection.
+
+The most common failure mode this catches is the split-write submit
+regression — a single PTY write of \"<msg>\\n\" or \"<msg>\\r\"
+fills the input box but doesn't submit, so the response never
+arrives and the regex fails.  See the comment in
+`claude-dashboard--deliver-pending' for the fix.
+
+With prefix arg KEEP, leave the disposable instance running after
+the test so you can inspect it manually.  Without KEEP, the
+instance is killed and the cwd's `.claude/' subdir (if any) is left
+in place."
+  (interactive "P")
+  (unless (file-directory-p claude-dashboard-schedule-self-test-cwd)
+    (make-directory claude-dashboard-schedule-self-test-cwd t))
+  (let* ((cwd claude-dashboard-schedule-self-test-cwd)
+         ;; Total expected wall time:
+         ;;   3s     — launch fire delay
+         ;; + 8s     — claude-dashboard-pending-launch-followup-delay
+         ;; + ~3s    — claude startup + a short response
+         ;; + 2s     — slack
+         (total-wait (+ 3 claude-dashboard-pending-launch-followup-delay 5))
+         (launch-id (claude-dashboard-schedule-launch
+                     cwd "+3s"
+                     claude-dashboard-schedule-self-test-prompt
+                     nil)))
+    (message "claude-dashboard self-test: waiting %ds for full pipeline..."
+             total-wait)
+    (let ((deadline (time-add (current-time) (seconds-to-time total-wait)))
+          (inst nil)
+          (matched nil)
+          (tail nil))
+      ;; Poll for the instance to register (launch fires at +3s).
+      (while (and (time-less-p (current-time) deadline)
+                  (not (and inst matched)))
+        (sit-for 1.0)
+        (setq inst (cl-find-if
+                    (lambda (i)
+                      (equal (expand-file-name cwd)
+                             (expand-file-name
+                              (or (claude-dashboard-instance-cwd i) ""))))
+                    (claude-dashboard--instances-list)))
+        (when inst
+          (with-current-buffer (claude-dashboard-instance-buffer inst)
+            (setq tail (buffer-substring-no-properties
+                        (max (point-min) (- (point-max) 4000))
+                        (point-max)))
+            (setq matched
+                  (and (string-match-p
+                        claude-dashboard-schedule-self-test-success-regexp
+                        tail)
+                       ;; Also verify the prompt itself was submitted —
+                       ;; "❯ <prompt>" appears in the conversation
+                       ;; history (NOT just sitting in the input box).
+                       (string-match-p
+                        (regexp-quote claude-dashboard-schedule-self-test-prompt)
+                        tail))))))
+      ;; Build results.
+      (let ((report
+             (with-temp-buffer
+               (insert (format "claude-dashboard-schedule self-test\n"))
+               (insert (format "===================================\n\n"))
+               (insert (format "Result:        %s\n" (if matched "PASS" "FAIL")))
+               (insert (format "Launch id:     %s\n" launch-id))
+               (insert (format "Cwd:           %s\n" cwd))
+               (insert (format "Prompt:        %S\n"
+                               claude-dashboard-schedule-self-test-prompt))
+               (insert (format "Success regex: %S\n"
+                               claude-dashboard-schedule-self-test-success-regexp))
+               (insert (format "Instance:      %s\n"
+                               (if inst
+                                   (buffer-name
+                                    (claude-dashboard-instance-buffer inst))
+                                 "(never registered)")))
+               (insert (format "Wall time:     %ds\n\n" total-wait))
+               (insert "Buffer tail:\n\n")
+               (insert (or tail "(no buffer tail captured)\n"))
+               (buffer-string))))
+        (with-current-buffer (get-buffer-create
+                              "*claude-dashboard schedule self-test*")
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert report)
+            (goto-char (point-min)))
+          (special-mode)
+          (display-buffer (current-buffer))))
+      ;; Cleanup unless KEEP.
+      (when (and inst (not keep))
+        (let ((b (claude-dashboard-instance-buffer inst))
+              (kill-buffer-query-functions nil))
+          (when (buffer-live-p b) (kill-buffer b))))
+      ;; Echo summary.
+      (if matched
+          (message "claude-dashboard self-test: PASS — pipeline working")
+        (message "claude-dashboard self-test: FAIL — see *…self-test* buffer"))
+      matched)))
+
 ;;; --- Dashboard integration -------------------------------------------------
 
 (with-eval-after-load 'claude-dashboard
