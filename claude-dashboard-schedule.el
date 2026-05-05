@@ -21,6 +21,25 @@
 ;; `claude-dashboard-pending-sends-file', launches in
 ;; `claude-dashboard-pending-launches-file' (both default to ~/.claude/).
 ;;
+;; Optional RENAME-NAME on either struct sends `/rename <name>' to the
+;; target session before the message body — useful for stamping a
+;; stable, searchable name onto a freshly-launched session before any
+;; conversation starts (otherwise the package's auto-name would derive
+;; a slug from the first prompt five turns in).  The rename injection
+;; defends against Claude's slash-command picker / autocomplete by
+;; sending ESC + C-u beforehand and using the split-write submit
+;; pattern (body, sit-for, lone CR) — see the comment in
+;; `claude-dashboard--inject-rename'.
+;;
+;; Target resolution (`claude-dashboard--find-instance-by-sid-or-cwd')
+;; prefers SID, falling back to YOUNGEST live instance in the matching
+;; CWD when SID is nil/unmatched.  The youngest-first rule fixes a bug
+;; where launch followups (whose enqueue-time SID is nil because claude
+;; hasn't written its transcript yet) would land on an older sibling
+;; instance in the same cwd.  Buffer names are intentionally not match
+;; keys: the package renames buffers on `/name' / `/rename', so a name
+;; captured at enqueue may not match the same instance at fire time.
+;;
 ;; Entry points:
 ;;   M-x claude-dashboard-schedule-send             (S in dashboard)
 ;;   M-x claude-dashboard-schedule-launch           (J in dashboard)
@@ -28,6 +47,7 @@
 ;;   M-x claude-dashboard-schedule-resume
 ;;   M-x claude-dashboard-list-pending-sends        (L in dashboard)
 ;;   M-x claude-dashboard-resume-pending-sends      (call after restart)
+;;   M-x claude-dashboard-schedule-self-test        (validate the pipeline)
 
 ;;; Code:
 
@@ -68,7 +88,14 @@ a long time to greet.  Ignored when the launch has no initial message."
 ;;; --- Data ------------------------------------------------------------------
 
 (cl-defstruct claude-dashboard-pending-send
-  id cwd sid message scheduled created timer)
+  ;; RENAME-NAME, when non-nil, is sent as `/rename <name>' BEFORE the
+  ;; message body and submit.  Applied via the same split-write submit
+  ;; pattern, with an extra ESC + C-u beforehand to dismiss any open
+  ;; slash-command picker (autocomplete:dismiss is bound to ESC in
+  ;; Claude Code's input layer).  After the rename, the package's
+  ;; auto-name suppression flag is set on the buffer so a subsequent
+  ;; auto-name can't overwrite the explicit name we just set.
+  id cwd sid message scheduled created timer rename-name)
 
 (cl-defstruct claude-dashboard-pending-launch
   ;; KIND is :plain (cold launch / --resume / arbitrary extra-args)
@@ -76,7 +103,11 @@ a long time to greet.  Ignored when the launch has no initial message."
   ;; For :plain, CWD is where claude runs and EXTRA-ARGS is the arg list.
   ;; For :worktree, CWD is the source repo and BRANCH names the new
   ;; worktree; the actual launch dir is derived at fire time.
-  id kind cwd extra-args branch initial-message scheduled created timer)
+  ;; RENAME-NAME, when non-nil, is propagated onto the followup
+  ;; pending-send (constructed at launch fire time) so the rename
+  ;; lands together with the initial message.
+  id kind cwd extra-args branch initial-message scheduled created timer
+  rename-name)
 
 (defvar claude-dashboard--pending-sends (make-hash-table :test 'equal)
   "id (string) → `claude-dashboard-pending-send'.")
@@ -178,6 +209,7 @@ Signal `user-error' on parse failure."
                           :cwd (claude-dashboard-pending-send-cwd p)
                           :sid (claude-dashboard-pending-send-sid p)
                           :message (claude-dashboard-pending-send-message p)
+                          :rename-name (claude-dashboard-pending-send-rename-name p)
                           :scheduled (claude-dashboard-pending-send-scheduled p)
                           :created (claude-dashboard-pending-send-created p)))))
 
@@ -193,27 +225,58 @@ Signal `user-error' on parse failure."
                           :branch (claude-dashboard-pending-launch-branch p)
                           :initial-message
                           (claude-dashboard-pending-launch-initial-message p)
+                          :rename-name
+                          (claude-dashboard-pending-launch-rename-name p)
                           :scheduled (claude-dashboard-pending-launch-scheduled p)
                           :created (claude-dashboard-pending-launch-created p)))))
 
 ;;; --- Target resolution -----------------------------------------------------
 
 (defun claude-dashboard--find-instance-by-sid-or-cwd (sid cwd)
-  "Return the live instance matching SID first, then CWD, or nil.
-Buffer names are intentionally NOT used as match keys — the package
-renames buffers on `/name', so they're unstable identifiers."
+  "Return the live instance matching SID; fall back to youngest-in-CWD.
+
+SID is the canonical identifier — when present and matched, that's
+the answer.  `claude-dashboard--live-session-id' is preferred over
+the cached struct field because the live PID-json is updated by
+claude immediately on session write while the struct field is only
+filled in on the next refresh.
+
+When SID is nil or unmatched, fall back to the YOUNGEST live
+instance whose cwd equals CWD (sorted by `started-at' descending).
+The youngest-first rule is what makes launch followups land on the
+just-launched session even when an older sibling shares the cwd —
+e.g. you scheduled a fresh launch in `~/projects/foo' and an older
+`~/projects/foo' instance is still hanging around.
+
+Buffer names are intentionally not match keys: the package renames
+buffers on `/name', so a name captured at enqueue may not match the
+same instance at fire time."
   (let ((cwd-canon (and cwd (expand-file-name cwd))))
-    (cl-find-if
-     (lambda (inst)
-       (or (and sid
-                (or (equal sid (claude-dashboard-instance-session-id inst))
-                    (and (fboundp 'claude-dashboard--live-session-id)
-                         (equal sid (claude-dashboard--live-session-id inst)))))
-           (and cwd-canon
-                (equal cwd-canon
-                       (expand-file-name
-                        (claude-dashboard-instance-cwd inst))))))
-     (claude-dashboard--instances-list))))
+    (or
+     ;; Definitive: sid match.
+     (and sid
+          (cl-find-if
+           (lambda (inst)
+             (or (equal sid (claude-dashboard-instance-session-id inst))
+                 (and (fboundp 'claude-dashboard--live-session-id)
+                      (equal sid (claude-dashboard--live-session-id inst)))))
+           (claude-dashboard--instances-list)))
+     ;; Fallback: youngest live instance whose cwd matches.
+     (and cwd-canon
+          (let ((candidates
+                 (cl-remove-if-not
+                  (lambda (inst)
+                    (let ((c (claude-dashboard-instance-cwd inst)))
+                      (and c (equal cwd-canon (expand-file-name c)))))
+                  (claude-dashboard--instances-list))))
+            (when candidates
+              ;; Sort youngest-first by started-at; copy first because
+              ;; sort is destructive on its argument.
+              (car (sort (copy-sequence candidates)
+                         (lambda (a b)
+                           (time-less-p
+                            (claude-dashboard-instance-started-at b)
+                            (claude-dashboard-instance-started-at a)))))))))))
 
 (defun claude-dashboard--instance-completion-table ()
   "Return a (display-string . instance) alist for completing-read."
@@ -268,6 +331,17 @@ renames buffers on `/name', so they're unstable identifiers."
          ;; give Claude a moment to consume that read, then send a lone
          ;; CR in a separate PTY write.  Empirically ~50ms is enough.
          (t
+          ;; If a rename was attached to the send, do that first so the
+          ;; session's name is set before the user-visible message
+          ;; lands.  Mark the buffer as `name-injected' afterwards so
+          ;; the package's auto-name pass can't overwrite our explicit
+          ;; choice 5 turns later.
+          (when-let ((rn (claude-dashboard-pending-send-rename-name p)))
+            (when (and (stringp rn) (not (string-empty-p (string-trim rn))))
+              (claude-dashboard--inject-rename proc rn)
+              (when (boundp 'claude-dashboard--name-injected)
+                (puthash (claude-dashboard-instance-buffer inst)
+                         t claude-dashboard--name-injected))))
           (process-send-string
            proc (claude-dashboard-pending-send-message p))
           (sit-for 0.05)
@@ -276,6 +350,33 @@ renames buffers on `/name', so they're unstable identifiers."
           (claude-dashboard--write-pending-sends)
           (message "claude-dashboard: delivered scheduled send to %s"
                    (buffer-name (claude-dashboard-instance-buffer inst)))))))))
+
+(defun claude-dashboard--inject-rename (proc rename-name)
+  "Send `/rename RENAME-NAME' through PROC and submit.
+
+Defends against Claude's slash-command picker / autocomplete:
+
+  - ESC first (autocomplete:dismiss in Claude's input bindings) clears
+    any picker that might be open from prior input.
+  - `C-u' clears any leftover input on the line.
+  - The slash command is then sent as a single complete token —
+    Claude's slash parser matches `/rename' as a complete command
+    rather than triggering the prefix picker that would fire on `/r'.
+  - The submit `\\r' is a separate PTY write so Claude's input layer
+    treats it as Enter (not as embedded CR in input — see split-write
+    note in the deliver function).
+  - A 0.5s wait at the end gives the rename time to land in the
+    PID-json `name' field so subsequent reads of the live name see
+    the new value."
+  (when (and proc (process-live-p proc))
+    (process-send-string proc "\e")          ; dismiss picker / autocomplete
+    (sit-for 0.1)
+    (process-send-string proc "\C-u")        ; clear input line
+    (sit-for 0.05)
+    (process-send-string proc (format "/rename %s" rename-name))
+    (sit-for 0.05)
+    (process-send-string proc "\r")          ; submit
+    (sit-for 0.5)))                          ; let the rename land
 
 ;;; --- Delivery: launches ---------------------------------------------------
 
@@ -315,6 +416,8 @@ renames buffers on `/name', so they're unstable identifiers."
                                         (expand-file-name cwd-of-launched))
                               :sid nil ; not known yet
                               :message msg
+                              :rename-name
+                              (claude-dashboard-pending-launch-rename-name p)
                               :scheduled
                               (time-add (current-time)
                                         (seconds-to-time
@@ -349,10 +452,18 @@ renames buffers on `/name', so they're unstable identifiers."
                     "When (e.g. +5m, 14:30, 2026-05-02 14:30): "))))
 
 ;;;###autoload
-(defun claude-dashboard-schedule-send (instance message when-spec)
+(defun claude-dashboard-schedule-send (instance message when-spec
+                                                &optional rename-name)
   "Schedule MESSAGE to be sent to INSTANCE at WHEN-SPEC.
 WHEN-SPEC is parsed by `claude-dashboard--parse-time-spec'.
-Interactively, prompt for each.  Default target is the dashboard
+
+When RENAME-NAME is non-nil, the deliver function sends
+`/rename RENAME-NAME' to the target session before the message body
+and marks the buffer as name-injected so the package's auto-name
+pass won't overwrite the choice later.
+
+Interactively, prompts for instance, message, time, and an optional
+rename (empty answer = no rename).  Default target is the dashboard
 instance at point, when invoked from the dashboard buffer."
   (interactive
    (let* ((insts (claude-dashboard--instances-list))
@@ -371,8 +482,10 @@ instance at point, when invoked from the dashboard buffer."
           (inst (cdr (assoc chosen table)))
           (msg (read-string "Message: "))
           (when-spec (read-string
-                      "When (e.g. +5m, 14:30, 2026-05-02 14:30): ")))
-     (list inst msg when-spec)))
+                      "When (e.g. +5m, 14:30, 2026-05-02 14:30): "))
+          (rn-raw (read-string "Rename session to (empty = no rename): "))
+          (rn (and (not (string-empty-p (string-trim rn-raw))) rn-raw)))
+     (list inst msg when-spec rn)))
   (when (string-empty-p (string-trim message))
     (user-error "Empty message"))
   (let* ((target-time (claude-dashboard--parse-time-spec when-spec))
@@ -386,6 +499,7 @@ instance at point, when invoked from the dashboard buffer."
                            (claude-dashboard--live-session-id instance))
                       (claude-dashboard-instance-session-id instance))
              :message message
+             :rename-name rename-name
              :scheduled target-time
              :created (current-time))))
     (setf (claude-dashboard-pending-send-timer p)
@@ -401,23 +515,33 @@ instance at point, when invoked from the dashboard buffer."
 
 ;;;###autoload
 (defun claude-dashboard-schedule-launch (cwd when-spec
-                                             &optional initial-message extra-args)
+                                             &optional initial-message
+                                             extra-args rename-name)
   "Schedule a fresh `claude' launch in CWD at WHEN-SPEC.
 Optional INITIAL-MESSAGE is sent to the new instance about
 `claude-dashboard-pending-launch-followup-delay' seconds after the
 launch fires (long enough for claude to reach its prompt).
 Optional EXTRA-ARGS are passed through to `claude'.
 
-Interactively, prompts for CWD (project picker), WHEN, then a message
-\(empty string = no follow-up)."
+When RENAME-NAME is non-nil, `/rename RENAME-NAME' is sent right
+before the initial message lands.  Useful for giving the freshly-
+launched session a stable, searchable name from the start instead
+of letting the package's auto-name derive a slug from the prompt
+five turns in.
+
+Interactively, prompts for CWD, WHEN, optional message, and an
+optional rename (empty answer = no rename)."
   (interactive
    (let* ((cwd (claude-dashboard--read-project))
           (when-spec
            (read-string "When (e.g. +5m, 14:30, 2026-05-02 14:30): "))
-          (msg (read-string "Initial message (empty = none): ")))
+          (msg (read-string "Initial message (empty = none): "))
+          (rn-raw (read-string "Rename session to (empty = no rename): "))
+          (rn (and (not (string-empty-p (string-trim rn-raw))) rn-raw)))
      (list cwd when-spec
            (and (not (string-empty-p (string-trim msg))) msg)
-           nil)))
+           nil
+           rn)))
   (let* ((target-time (claude-dashboard--parse-time-spec when-spec))
          (id (claude-dashboard--make-id))
          (p (make-claude-dashboard-pending-launch
@@ -425,6 +549,7 @@ Interactively, prompts for CWD (project picker), WHEN, then a message
              :cwd (expand-file-name cwd)
              :extra-args extra-args
              :initial-message initial-message
+             :rename-name rename-name
              :scheduled target-time
              :created (current-time))))
     (setf (claude-dashboard-pending-launch-timer p)
@@ -440,32 +565,42 @@ Interactively, prompts for CWD (project picker), WHEN, then a message
 
 ;;;###autoload
 (defun claude-dashboard-schedule-resume (cwd sid when-spec
-                                             &optional initial-message)
+                                             &optional initial-message
+                                             rename-name)
   "Schedule `claude --resume SID' in CWD at WHEN-SPEC.
 Equivalent to `claude-dashboard-schedule-launch' with
-EXTRA-ARGS = (\"--resume\" SID).  INITIAL-MESSAGE optional."
+EXTRA-ARGS = (\"--resume\" SID).  INITIAL-MESSAGE and RENAME-NAME
+are forwarded to the launch."
   (interactive
    (list (claude-dashboard--read-project)
          (read-string "Session id (sid) to resume: ")
          (read-string "When: ")
          (let ((m (read-string "Initial message (empty = none): ")))
-           (and (not (string-empty-p (string-trim m))) m))))
+           (and (not (string-empty-p (string-trim m))) m))
+         (let ((rn (read-string "Rename session to (empty = no rename): ")))
+           (and (not (string-empty-p (string-trim rn))) rn))))
   (claude-dashboard-schedule-launch
-   cwd when-spec initial-message (list "--resume" sid)))
+   cwd when-spec initial-message (list "--resume" sid) rename-name))
 
 ;;;###autoload
 (defun claude-dashboard-schedule-launch-worktree (source-cwd branch when-spec
-                                                             &optional initial-message)
+                                                             &optional initial-message
+                                                             rename-name)
   "Schedule a new git worktree on BRANCH under SOURCE-CWD's repo + claude launch.
 At WHEN-SPEC we run the equivalent of `claude-dashboard-new-worktree
 SOURCE-CWD BRANCH', which creates the worktree and starts claude in it.
-INITIAL-MESSAGE, if non-empty, is delivered after the launch settles."
+INITIAL-MESSAGE, if non-empty, is delivered after the launch settles.
+RENAME-NAME, if non-nil, is sent as `/rename RENAME-NAME' before the
+initial message — useful since auto-named worktree slugs default to
+the branch name; pass an explicit rename to override."
   (interactive
    (list (claude-dashboard--read-project)
          (read-string "Branch / worktree name: ")
          (read-string "When: ")
          (let ((m (read-string "Initial message (empty = none): ")))
-           (and (not (string-empty-p (string-trim m))) m))))
+           (and (not (string-empty-p (string-trim m))) m))
+         (let ((rn (read-string "Rename session to (empty = no rename): ")))
+           (and (not (string-empty-p (string-trim rn))) rn))))
   (when (or (null branch) (string-empty-p (string-trim branch)))
     (user-error "Branch name is required"))
   (let* ((target-time (claude-dashboard--parse-time-spec when-spec))
@@ -475,6 +610,7 @@ INITIAL-MESSAGE, if non-empty, is delivered after the launch settles."
              :cwd (expand-file-name source-cwd)
              :branch (string-trim branch)
              :initial-message initial-message
+             :rename-name rename-name
              :scheduled target-time
              :created (current-time))))
     (setf (claude-dashboard-pending-launch-timer p)
@@ -558,6 +694,7 @@ Idempotent within an Emacs session.  Past-due entries fire immediately."
                    :cwd (plist-get e :cwd)
                    :sid (plist-get e :sid)
                    :message (plist-get e :message)
+                   :rename-name (plist-get e :rename-name)
                    :scheduled target
                    :created (plist-get e :created))))
           (puthash id p claude-dashboard--pending-sends)
@@ -577,6 +714,7 @@ Idempotent within an Emacs session.  Past-due entries fire immediately."
                    :extra-args (plist-get e :extra-args)
                    :branch (plist-get e :branch)
                    :initial-message (plist-get e :initial-message)
+                   :rename-name (plist-get e :rename-name)
                    :scheduled target
                    :created (plist-get e :created))))
           (puthash id p claude-dashboard--pending-launches)
