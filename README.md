@@ -1,15 +1,16 @@
 # claude-dashboard.el
 
-A magit-style Emacs buffer for managing the Claude Code instances you launch
-from Emacs. Each instance runs in its own [eat](https://codeberg.org/akib/emacs-eat)
+A magit-style Emacs buffer for managing TUI agent instances you launch
+from Emacs — Claude Code by default, with opt-in support for [opencode](https://opencode.ai/).
+Each instance runs in its own [eat](https://codeberg.org/akib/emacs-eat)
 terminal buffer rooted at a project directory; the dashboard docks at the
 bottom of the frame and shows them as a single line each — project tag,
 state, uptime, deploy branch, session id, latest activity, and the
 conversation's name.
 
 The dashboard tracks only instances **launched through it**.  Each
-`claude` runs as a direct Emacs subprocess (no multiplexer wrapping)
-and dies when Emacs exits.
+backend process runs as a direct Emacs subprocess (no multiplexer
+wrapping) and dies when Emacs exits.
 
 ## Install
 
@@ -85,6 +86,39 @@ makes that footgun too easy. Reachable via `M-x claude-dashboard-restart`.
 Project root selection offers `project-known-project-roots` first, then
 directories from `recentf-list`, then a free-form `read-directory-name`.
 
+## Backends
+
+The dashboard multiplexes over backend CLIs that share the same shape
+(a TUI agent, a per-user state directory, a `--resume` / `--continue`
+convention). Two are wired up out of the box:
+
+| Backend  | Program    | State dir                       | Status                              |
+| -------- | ---------- | ------------------------------- | ----------------------------------- |
+| `claude` | `claude`   | `~/.claude`                     | Default; full feature set.          |
+| `opencode` | `opencode` | `~/.local/share/opencode`       | Process / launch / manifest / resume; transcript-derived columns (topic, model, last activity, exchange body, kind-classifier) currently stub out because opencode's on-disk schema is SQLite, not Claude's per-session JSONL. |
+
+Switch with a single defcustom:
+
+```elisp
+;; Default — Claude Code
+(setq claude-dashboard-backend 'claude)
+
+;; Or opt in to opencode
+(setq claude-dashboard-backend 'opencode)
+```
+
+The `claude-dashboard-program`, `claude-dashboard-claude-dir`,
+`claude-dashboard-spinner-regexp`, and `claude-dashboard-manifest-file`
+defcustoms still work — when set, they override the backend defaults,
+which is useful for pinning an absolute path or sharing a manifest
+across backends. Leave them at their nil / `auto` defaults to let the
+active backend supply the value.
+
+Adding a new backend means adding an entry to `claude-dashboard-backends`
+with `:program`, `:state-dir`, `:spinner-regexp`, `:resume-flag`,
+`:continue-flag`, `:worktree-subdir`, and `:transcript-style`. See the
+`claude-dashboard-backends` docstring for the full key list.
+
 ## Behavior notes
 
 ### Status
@@ -92,9 +126,9 @@ directories from `recentf-list`, then a free-form `read-directory-name`.
 Three states only — earlier `awaiting` / `monitoring` heuristics misfired
 too often and were removed:
 
-- **● `RUN`** — Claude Code's progress spinner (`esc to interrupt`) is
-  visible in the eat buffer tail; the agent is producing output or
-  running a tool.
+- **● `RUN`** — the active backend's progress spinner is visible in the
+  eat buffer tail (`esc to interrupt` for Claude); the agent is
+  producing output or running a tool.
 - **◐ `IDL`** — process alive, no spinner.
 - **○ `EXT`** — process gone.
 
@@ -122,34 +156,40 @@ too often and were removed:
 
 ### Process lifecycle
 
-`claude` runs as a direct Emacs subprocess inside an `eat`-allocated
-PTY.  When Emacs exits, the PTY closes and `claude` exits too —
-there is no terminal-multiplexer integration.  Earlier branches
-experimented with both GNU `screen` and `dtach`; neither survived
-enough of the visual artifacts and per-keystroke latency they
-introduced into eat to be worth the survival benefit.  If you need
-to pick a conversation back up after restart, the per-session
-transcripts live at `~/.claude/projects/<slug>/<sid>.jsonl` and
-`claude --resume <sid>` works on a fresh launch.
+The backend process runs as a direct Emacs subprocess inside an
+`eat`-allocated PTY.  When Emacs exits, the PTY closes and the agent
+exits too — there is no terminal-multiplexer integration.  Earlier
+branches experimented with both GNU `screen` and `dtach`; neither
+survived enough of the visual artifacts and per-keystroke latency
+they introduced into eat to be worth the survival benefit.  If you
+need to pick a conversation back up after restart, the per-session
+transcripts live at `<state-dir>/projects/<slug>/<sid>.jsonl` (for
+Claude: `~/.claude/projects/…`) and `claude --resume <sid>` works on
+a fresh launch.  Use `M-x claude-dashboard-resume-all` to relaunch
+every session recorded in the manifest.
 
 ## Customization
 
 ```elisp
-;; Process / launch
-(setq claude-dashboard-program "claude"             ;; or absolute path
-      claude-dashboard-program-args nil)            ;; extra CLI args
+;; Backend selection (default `claude'; `opencode' also supported)
+(setq claude-dashboard-backend 'claude)
+
+;; Process / launch — leave program/state-dir nil to inherit from backend
+(setq claude-dashboard-program nil                   ;; or "claude" / abs path
+      claude-dashboard-program-args nil              ;; extra CLI args
+      claude-dashboard-claude-dir nil)               ;; nil = backend default
 
 ;; Layout
-(setq claude-dashboard-fit-window t                 ;; nil = use default
+(setq claude-dashboard-fit-window t                  ;; nil = use default
       claude-dashboard-fit-min-height 4
-      claude-dashboard-side 'bottom)                ;; 'top or 'bottom
+      claude-dashboard-side 'bottom)                 ;; 'top or 'bottom
 
-;; Refresh + classifier
+;; Refresh + classifier (nil spinner-regexp = backend default)
 (setq claude-dashboard-refresh-interval 5
       claude-dashboard-cache-ttl 30
       claude-dashboard-tail-chars 2000
-      claude-dashboard-spinner-regexp "esc to interrupt")
+      claude-dashboard-spinner-regexp nil)
 
 ;; Auto-naming
-(setq claude-dashboard-auto-name-after-turns 5)     ;; nil disables
+(setq claude-dashboard-auto-name-after-turns 5)      ;; nil disables
 ```
