@@ -718,9 +718,12 @@ For the main checkout return \"main\".  For non-git directories return nil."
         value))))
 
 (defun claude-dashboard--last-prompt-for (cwd)
-  "Tail the backend's history.jsonl and return the most recent prompt for CWD."
+  "Tail the backend's history.jsonl and return the most recent prompt for CWD.
+Returns nil for backends without the Claude-style history.jsonl
+\(currently anything other than `:transcript-style' = `jsonl')."
   (let ((file (expand-file-name "history.jsonl" (claude-dashboard--state-dir))))
-    (when (file-readable-p file)
+    (when (and (eq (claude-dashboard--backend-prop :transcript-style) 'jsonl)
+               (file-readable-p file))
       (with-temp-buffer
         (let* ((size (file-attribute-size (file-attributes file)))
                (start (max 0 (- size 65536))))
@@ -750,10 +753,15 @@ For the main checkout return \"main\".  For non-git directories return nil."
 ;;; Session-info enrichment
 
 (defun claude-dashboard--read-session-json (pid)
-  "Read the backend's sessions/<PID>.json and return its alist, or nil."
+  "Read the backend's sessions/<PID>.json and return its alist, or nil.
+Returns nil for backends that don't keep a per-PID JSON metadata
+file (i.e. anything other than `:transcript-style' = `jsonl').
+Callers — `--live-session-id', `--live-session-name', and
+`--enrich-instance' — already tolerate a nil return."
   (let ((file (expand-file-name (format "sessions/%d.json" pid)
                                 (claude-dashboard--state-dir))))
-    (when (file-readable-p file)
+    (when (and (eq (claude-dashboard--backend-prop :transcript-style) 'jsonl)
+               (file-readable-p file))
       (with-temp-buffer
         (insert-file-contents file)
         (goto-char (point-min))
