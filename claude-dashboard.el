@@ -28,12 +28,98 @@
   :group 'tools
   :prefix "claude-dashboard-")
 
-(defcustom claude-dashboard-program "claude"
-  "Executable used to launch a Claude Code instance."
-  :type 'string)
+;;; --- Backend selection ---------------------------------------------------
+;;
+;; The dashboard was originally Claude-specific; it now multiplexes over
+;; backend CLIs that follow the same shape (a TUI agent, a per-user state
+;; directory with per-project session transcripts, a --resume / --continue
+;; convention).  `claude-dashboard-backend' picks which one is active for
+;; this Emacs session; `claude-dashboard-backends' is the registry the
+;; rest of the file dispatches against.  Claude remains the default —
+;; switching is a single defcustom change.
+;;
+;; Adding a new backend means: append an entry to `claude-dashboard-backends'
+;; with the keys documented in its docstring, and (when feature parity
+;; matters) implement the transcript-reader hooks.  The accessor helpers
+;; (`claude-dashboard--backend-prop' etc.) below are the only callers that
+;; need to know about the registry.
+
+(defcustom claude-dashboard-backend 'claude
+  "Active backend CLI for the dashboard.
+A symbol whose `assq' lookup against `claude-dashboard-backends'
+yields the running backend's plist.  Claude is the default and
+the only fully-supported backend; `opencode' is wired up at the
+process/manifest level but its transcript-derived columns are
+stubbed out until the schema is mapped."
+  :type '(choice (const :tag "Claude Code" claude)
+                 (const :tag "opencode" opencode)
+                 (symbol :tag "Other"))
+  :group 'claude-dashboard)
+
+(defcustom claude-dashboard-backends
+  `((claude
+     :program          "claude"
+     :state-dir        ,(expand-file-name "~/.claude")
+     :spinner-regexp   "esc to interrupt"
+     :resume-flag      "--resume"
+     :continue-flag    "--continue"
+     :worktree-subdir  ".claude/worktrees"
+     :transcript-style jsonl)
+    (opencode
+     :program          "opencode"
+     :state-dir        ,(expand-file-name "~/.local/share/opencode")
+     ;; Opencode's TUI spinner phrasing is not yet mapped; this regex
+     ;; intentionally matches nothing so a running opencode session shows
+     ;; as IDL rather than flapping.  Override per-backend once the real
+     ;; marker is known.
+     :spinner-regexp   "\\`a\\`"
+     :resume-flag      "--session"
+     :continue-flag    "--continue"
+     :worktree-subdir  ".opencode/worktrees"
+     :transcript-style sqlite))
+  "Registry of supported backend CLIs.
+Each entry is `(NAME . PLIST)' where PLIST has at least:
+
+  :program          Executable name used to launch a session.
+  :state-dir        Per-user state directory the backend writes to.
+  :spinner-regexp   Regex matched in the eat tail to detect `running'.
+  :resume-flag      CLI flag for resuming a session by id.
+  :continue-flag    CLI flag for resuming the most recent session.
+  :worktree-subdir  Relative path under the main worktree where new
+                    branch worktrees are created.
+  :transcript-style Symbol describing how this backend stores session
+                    transcripts (`jsonl' = Claude's per-session jsonl
+                    files under projects/<slug>/; other values are
+                    treated by transcript helpers as opaque/stubbed)."
+  :type '(alist :key-type symbol
+                :value-type (plist :key-type symbol :value-type sexp))
+  :group 'claude-dashboard)
+
+(defun claude-dashboard--backend-plist (&optional name)
+  "Return the plist for backend NAME (or the active backend)."
+  (or (cdr (assq (or name claude-dashboard-backend)
+                 claude-dashboard-backends))
+      (cdr (assq 'claude claude-dashboard-backends))))
+
+(defun claude-dashboard--backend-prop (key &optional name)
+  "Look up KEY in backend NAME's plist (or the active backend's)."
+  (plist-get (claude-dashboard--backend-plist name) key))
+
+(defcustom claude-dashboard-program nil
+  "Executable used to launch a backend instance.
+When nil (the default) the program name is taken from the active
+backend's `:program' slot — this keeps Claude as the default and
+lets `claude-dashboard-backend' switch the CLI without touching
+this defcustom.  Set explicitly to override per-Emacs-session."
+  :type '(choice (const :tag "From active backend" nil) string))
+
+(defun claude-dashboard--program ()
+  "Resolve the current program name (override → backend default)."
+  (or claude-dashboard-program
+      (claude-dashboard--backend-prop :program)))
 
 (defcustom claude-dashboard-program-args nil
-  "Extra arguments passed to `claude-dashboard-program' on launch."
+  "Extra arguments passed to the backend program on launch."
   :type '(repeat string))
 
 (defcustom claude-dashboard-buffer-name "*Claude Dashboard*"
@@ -52,10 +138,18 @@
   "Seconds to cache git branch and last-prompt lookups per instance."
   :type 'number)
 
-(defcustom claude-dashboard-claude-dir
-  (expand-file-name "~/.claude")
-  "Root of Claude Code's per-user state directory."
-  :type 'directory)
+(defcustom claude-dashboard-claude-dir nil
+  "Override for the backend's per-user state directory.
+When nil (the default) the directory is taken from the active
+backend's `:state-dir' slot — e.g. `~/.claude' for Claude,
+`~/.local/share/opencode' for opencode.  Set to a directory to
+pin it regardless of the active backend."
+  :type '(choice (const :tag "From active backend" nil) directory))
+
+(defun claude-dashboard--state-dir ()
+  "Resolve the current state directory (override → backend default)."
+  (or claude-dashboard-claude-dir
+      (claude-dashboard--backend-prop :state-dir)))
 
 ;;; Data model
 
@@ -306,11 +400,20 @@ Wide enough to catch the spinner across the framing borders that may
 sit between it and point-max."
   :type 'integer :group 'claude-dashboard)
 
-(defcustom claude-dashboard-spinner-regexp "esc to interrupt"
-  "Regexp marking Claude Code's live progress spinner.
-Match anywhere in the tail means the agent is actively working
+(defcustom claude-dashboard-spinner-regexp nil
+  "Override for the running-spinner regexp.
+When nil (the default) the regexp is taken from the active
+backend's `:spinner-regexp' slot — Claude's `esc to interrupt'
+for `claude', a backend-specific marker for others.  Match
+anywhere in the tail means the agent is actively working
 \(generating tokens or running a tool); absence means it's idle."
-  :type 'regexp :group 'claude-dashboard)
+  :type '(choice (const :tag "From active backend" nil) regexp)
+  :group 'claude-dashboard)
+
+(defun claude-dashboard--spinner-regexp ()
+  "Resolve the current spinner regexp (override → backend default)."
+  (or claude-dashboard-spinner-regexp
+      (claude-dashboard--backend-prop :spinner-regexp)))
 
 ;;; --- Session-kind classification (monitor vs code) ----------------------
 ;;
@@ -493,7 +596,7 @@ that started polling after finishing the bug fix)."
      ((with-current-buffer (claude-dashboard-instance-buffer inst)
         (save-excursion
           (goto-char (point-max))
-          (re-search-backward claude-dashboard-spinner-regexp
+          (re-search-backward (claude-dashboard--spinner-regexp)
                               (max (point-min)
                                    (- (point-max)
                                       claude-dashboard-tail-chars))
@@ -615,8 +718,8 @@ For the main checkout return \"main\".  For non-git directories return nil."
         value))))
 
 (defun claude-dashboard--last-prompt-for (cwd)
-  "Tail ~/.claude/history.jsonl and return the most recent prompt for CWD."
-  (let ((file (expand-file-name "history.jsonl" claude-dashboard-claude-dir)))
+  "Tail the backend's history.jsonl and return the most recent prompt for CWD."
+  (let ((file (expand-file-name "history.jsonl" (claude-dashboard--state-dir))))
     (when (file-readable-p file)
       (with-temp-buffer
         (let* ((size (file-attribute-size (file-attributes file)))
@@ -647,9 +750,9 @@ For the main checkout return \"main\".  For non-git directories return nil."
 ;;; Session-info enrichment
 
 (defun claude-dashboard--read-session-json (pid)
-  "Read ~/.claude/sessions/<PID>.json and return its alist, or nil."
+  "Read the backend's sessions/<PID>.json and return its alist, or nil."
   (let ((file (expand-file-name (format "sessions/%d.json" pid)
-                                claude-dashboard-claude-dir)))
+                                (claude-dashboard--state-dir))))
     (when (file-readable-p file)
       (with-temp-buffer
         (insert-file-contents file)
@@ -693,7 +796,7 @@ separators, so e.g. `/home/me/projects/gsk_broad/' becomes
              (proj-dir (expand-file-name
                         (format "projects/%s"
                                 (claude-dashboard--encode-cwd cwd))
-                        claude-dashboard-claude-dir))
+                        (claude-dashboard--state-dir)))
              (jsonl (claude-dashboard--latest-jsonl proj-dir)))
         (when (and jsonl (file-readable-p jsonl))
           (with-temp-buffer
@@ -998,9 +1101,11 @@ the first user-typed prompt found, truncated to 80 chars."
                  (if (> (length s) 80) (concat (substring s 0 77) "...") s))))))
 
 (defun claude-dashboard--past-sessions ()
-  "Scan ~/.claude/projects/ and return a list of `claude-dashboard-past-session'.
-Sorted by mtime, newest first."
-  (let* ((root (expand-file-name "projects" claude-dashboard-claude-dir))
+  "Scan the backend's projects/ tree and return `claude-dashboard-past-session's.
+Sorted by mtime, newest first.  Only meaningful for backends with
+`:transcript-style' = `jsonl' (e.g. claude); other backends return
+nil because their on-disk schema isn't mapped here yet."
+  (let* ((root (expand-file-name "projects" (claude-dashboard--state-dir)))
          (acc '()))
     (when (file-directory-p root)
       (dolist (proj-dir (directory-files root t "^[^.]" t))
@@ -1161,22 +1266,34 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
 
 ;;; Crash recovery — manifest of running sessions
 
-(defcustom claude-dashboard-manifest-file
-  (expand-file-name "dashboard-manifest.el" claude-dashboard-claude-dir)
+(defcustom claude-dashboard-manifest-file 'auto
   "File where a snapshot of currently-running sessions is persisted.
 Read by `claude-dashboard-resume-all' to relaunch every session
-that was open before an emacs crash / quit, via
-`claude --resume <sid>'.  Set to nil to disable manifest writes
-entirely."
-  :type '(choice (const :tag "Disabled" nil) file)
+that was open before an emacs crash / quit.  When the symbol
+`auto' (the default), the file lives at
+`dashboard-manifest.el' under the active backend's state dir,
+so claude and opencode get separate manifests automatically.
+Set to nil to disable manifest writes entirely, or to an
+explicit file path to pin it."
+  :type '(choice (const :tag "Auto (per backend)" auto)
+                 (const :tag "Disabled" nil)
+                 file)
   :group 'claude-dashboard)
+
+(defun claude-dashboard--manifest-path ()
+  "Resolve the current manifest path, or nil when manifest is disabled."
+  (pcase claude-dashboard-manifest-file
+    ('nil  nil)
+    ('auto (expand-file-name "dashboard-manifest.el"
+                             (claude-dashboard--state-dir)))
+    (path  path)))
 
 (defun claude-dashboard--write-manifest ()
   "Persist (cwd, sid) for each registered instance to the manifest file.
 Safe to call any number of times; entries without a resolved sid
 are written too (sid = nil) so `--resume-all' can attempt to look
 them up at recovery time, but they're best-effort."
-  (when claude-dashboard-manifest-file
+  (when-let ((manifest-file (claude-dashboard--manifest-path)))
     (let ((entries
            (cl-loop for inst in (claude-dashboard--instances-list)
                     for cwd = (claude-dashboard-instance-cwd inst)
@@ -1186,21 +1303,21 @@ them up at recovery time, but they're best-effort."
                     when cwd
                     collect (list :cwd cwd :sid sid
                                   :recorded (current-time)))))
-      (let ((dir (file-name-directory claude-dashboard-manifest-file)))
+      (let ((dir (file-name-directory manifest-file)))
         (when (and dir (not (file-directory-p dir)))
           (make-directory dir t)))
-      (with-temp-file claude-dashboard-manifest-file
+      (with-temp-file manifest-file
         (insert ";;; -*- lisp-data -*-\n")
         (let ((print-level nil) (print-length nil))
           (prin1 entries (current-buffer)))
         (insert "\n")))))
 
 (defun claude-dashboard--read-manifest ()
-  "Read `claude-dashboard-manifest-file' and return the entry list, or nil."
-  (when (and claude-dashboard-manifest-file
-             (file-readable-p claude-dashboard-manifest-file))
+  "Read the active manifest file and return the entry list, or nil."
+  (when-let* ((manifest-file (claude-dashboard--manifest-path))
+              (_ (file-readable-p manifest-file)))
     (with-temp-buffer
-      (insert-file-contents claude-dashboard-manifest-file)
+      (insert-file-contents manifest-file)
       (goto-char (point-min))
       (ignore-errors (read (current-buffer))))))
 
@@ -1235,24 +1352,27 @@ weeks ago doesn't surprise you."
      ((y-or-n-p (format "Resume %d session(s) from manifest? "
                         (length candidates)))
       (dolist (c candidates)
-        (claude-dashboard--launch (car c) (list "--resume" (cdr c))))
+        (claude-dashboard--launch
+         (car c)
+         (list (claude-dashboard--backend-prop :resume-flag) (cdr c))))
       (message "claude-dashboard: resumed %d session(s)" (length candidates))))))
 
 (defun claude-dashboard--launch (cwd extra-args)
-  "Launch claude in CWD passing EXTRA-ARGS, register, refresh, and pop to buffer."
+  "Launch the active backend in CWD with EXTRA-ARGS, register, refresh, pop."
   (let* ((default-directory cwd)
          (name (claude-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
+         (program (claude-dashboard--program))
          (args (append claude-dashboard-program-args extra-args)))
     (with-current-buffer buf
       ;; Eat's shell-prompt annotation reserves a one-column left margin.
-      ;; Claude Code is a TUI app, not a shell — the column shifts the
-      ;; whole frame right and clips the right edge of the boxed prompt,
-      ;; producing an apparent extra wrap line.  Disable it before
-      ;; `eat-mode' runs so the margin isn't installed in this buffer.
+      ;; Backends like Claude Code are TUI apps, not shells — the column
+      ;; shifts the whole frame right and clips the right edge of the
+      ;; boxed prompt, producing an apparent extra wrap line.  Disable it
+      ;; before `eat-mode' runs so the margin isn't installed.
       (setq-local eat-enable-shell-prompt-annotation nil)
       (unless (derived-mode-p 'eat-mode) (eat-mode))
-      (eat-exec buf name claude-dashboard-program nil args))
+      (eat-exec buf name program nil args))
     (claude-dashboard--register buf cwd)
     (claude-dashboard--maybe-refresh)
     (pop-to-buffer buf claude-dashboard-instance-window-action)
@@ -1260,20 +1380,24 @@ weeks ago doesn't surprise you."
 
 ;;;###autoload
 (defun claude-dashboard-new (cwd)
-  "Launch a new Claude instance in CWD as an eat buffer."
+  "Launch a new backend instance in CWD as an eat buffer."
   (interactive (list (claude-dashboard--read-project)))
   (claude-dashboard--launch cwd nil))
 
 (defun claude-dashboard--worktree-target-dir (main-wt branch)
-  "Return Claude's standard worktree path: <MAIN-WT>/.claude/worktrees/<BRANCH>."
+  "Return the backend's standard worktree path: <MAIN-WT>/<subdir>/<BRANCH>.
+The `<subdir>' comes from the active backend's `:worktree-subdir'
+slot (e.g. `.claude/worktrees' for Claude)."
   (file-name-as-directory
-   (expand-file-name (format ".claude/worktrees/%s" branch)
+   (expand-file-name (format "%s/%s"
+                             (claude-dashboard--backend-prop :worktree-subdir)
+                             branch)
                      main-wt)))
 
 ;;;###autoload
 (defun claude-dashboard-new-worktree (source-cwd branch)
-  "Create a new git worktree + BRANCH under SOURCE-CWD's repo, then launch Claude.
-Worktree lands at `<main-worktree>/.claude/worktrees/<BRANCH>'.  TOPIC
+  "Create a new git worktree + BRANCH under SOURCE-CWD's repo, then launch backend.
+Worktree lands at `<main-worktree>/<backend-subdir>/<BRANCH>'.  TOPIC
 is pre-bound to BRANCH and `/name BRANCH' is injected on first idle."
   (interactive
    (let* ((default-cwd
@@ -1311,9 +1435,10 @@ is pre-bound to BRANCH and `/name BRANCH' is injected on first idle."
 
 ;;;###autoload
 (defun claude-dashboard-continue (cwd)
-  "Run `claude --continue' in CWD, resuming the most recent session there."
+  "Resume the most recent session in CWD via the backend's continue flag."
   (interactive (list (claude-dashboard--read-project)))
-  (claude-dashboard--launch cwd '("--continue")))
+  (claude-dashboard--launch
+   cwd (list (claude-dashboard--backend-prop :continue-flag))))
 
 ;;;###autoload
 (defun claude-dashboard-resume (&optional only-cwd)
@@ -1329,7 +1454,8 @@ With prefix arg or when called from a row, restrict to that row's cwd."
   (let* ((sess (claude-dashboard--read-past-session only-cwd))
          (sid (claude-dashboard-past-session-session-id sess))
          (cwd (claude-dashboard-past-session-cwd sess))
-         (buf (claude-dashboard--launch cwd (list "--resume" sid)))
+         (buf (claude-dashboard--launch
+               cwd (list (claude-dashboard--backend-prop :resume-flag) sid)))
          (inst (gethash buf claude-dashboard--instances)))
     (when inst
       (setf (claude-dashboard-instance-session-id inst) sid)
@@ -1529,7 +1655,7 @@ Reuses an existing instance window if one is visible."
             (inhibit-read-only t))
         ;; eat-exec blasts any running process in BUF for us.
         (eat-exec buf (buffer-name buf)
-                  claude-dashboard-program nil
+                  (claude-dashboard--program) nil
                   claude-dashboard-program-args)))
     (let ((inst2 (gethash buf claude-dashboard--instances)))
       (when inst2
@@ -1564,10 +1690,13 @@ Reuses an existing instance window if one is visible."
   "Map buffer → (topic-string . time).  Refreshed via the standard TTL.")
 
 (defun claude-dashboard--first-prompt-for-session (sid)
-  "Return the first prompt logged for session SID in history.jsonl, or nil."
-  (when sid
+  "Return the first prompt logged for session SID in history.jsonl, or nil.
+Backend-specific: only the `jsonl' transcript style stores prompts
+in a single per-user history file; other backends return nil."
+  (when (and sid (eq (claude-dashboard--backend-prop :transcript-style)
+                     'jsonl))
     (claude-dashboard--map-jsonl-entries
-     (expand-file-name "history.jsonl" claude-dashboard-claude-dir)
+     (expand-file-name "history.jsonl" (claude-dashboard--state-dir))
      (lambda (entry)
        (and (equal sid (alist-get 'sessionId entry))
             (alist-get 'display entry))))))
@@ -1576,11 +1705,14 @@ Reuses an existing instance window if one is visible."
   "Locate the most-recently-modified jsonl transcript for SID.
 Scans every project subdir and picks the freshest file (mtime is
 authoritative since the same sid can appear under multiple cwds).
-The CWD argument is accepted for caller convenience but ignored."
-  (when sid
+The CWD argument is accepted for caller convenience but ignored.
+Backend-specific: only the `jsonl' transcript style is supported;
+other backends return nil so callers fall back to empty results."
+  (when (and sid (eq (claude-dashboard--backend-prop :transcript-style)
+                     'jsonl))
     (let* ((target (concat sid ".jsonl"))
            (projects-dir (expand-file-name "projects"
-                                           claude-dashboard-claude-dir))
+                                           (claude-dashboard--state-dir)))
            candidates)
       (when (file-directory-p projects-dir)
         (dolist (sub (directory-files projects-dir t "^[^.]"))
