@@ -387,6 +387,14 @@ Set to nil to let your usual window-management rules size it."
   "Minimum number of lines the dashboard window may shrink to."
   :type 'integer :group 'claude-dashboard)
 
+(defcustom claude-dashboard-fit-max-height nil
+  "Maximum number of lines the dashboard window may grow to.
+When nil, the dashboard is capped at half the frame's text height
+so expanded query sections never push the other windows into a
+sliver at the top.  An integer pins the cap to that many rows."
+  :type '(choice (const :tag "Half the frame height" nil) integer)
+  :group 'claude-dashboard)
+
 (defcustom claude-dashboard-side 'bottom
   "Frame side the dashboard occupies when `claude-dashboard-fit-window' is on.
 One of `top' or `bottom'.  Side windows give `fit-window-to-buffer'
@@ -2142,8 +2150,16 @@ three progressive views: rows-only (1), rows + queries (2), rows
       ;; nothing to shrink to.
       (unless (frame-root-window-p win)
         (with-selected-window win
-          (fit-window-to-buffer
-           win nil claude-dashboard-fit-min-height nil nil t))))))
+          ;; Cap max height so that with sections expanded the buffer's
+          ;; tall content doesn't push every other window into a 4-row
+          ;; strip; the dashboard then visually anchors at the bottom
+          ;; rather than swallowing the whole frame.
+          (let* ((frame-h (frame-text-lines (window-frame win)))
+                 (max-h (max claude-dashboard-fit-min-height
+                             (or claude-dashboard-fit-max-height
+                                 (/ frame-h 2)))))
+            (fit-window-to-buffer
+             win max-h claude-dashboard-fit-min-height nil nil t)))))))
 
 (defun claude-dashboard--display-action ()
   "Action argument for `display-buffer' that docks the dashboard.
