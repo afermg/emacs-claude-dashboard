@@ -1822,14 +1822,17 @@ Claude has actually written the matching `/name' to its metadata."
         (puthash buf (cons val now) claude-dashboard--topic-cache)
         val))))
 
-(defun claude-dashboard--row-format (branch-w _topic-w)
-  "Return the row format with dynamic BRANCH-W width.
-TOPIC is the trailing column and is rendered with `%s' so short
-topics don't pad with trailing spaces — that padding could push
-the visible row past the window's right edge and wrap to a
-second line on narrower windows."
-  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-24s  %%s"
-          claude-dashboard-project-max-width branch-w))
+(defun claude-dashboard--row-format (branch-w topic-w)
+  "Return the row format with dynamic BRANCH-W and TOPIC-W widths.
+ACTIVITY is the trailing column and is rendered with `%s' so it
+doesn't pad with trailing spaces — that padding could push the
+visible row past the window's right edge and wrap to a second
+line on narrower windows.  TOPIC sits before ACTIVITY at a width
+that fits the longest actual session name (capped by
+`claude-dashboard-topic-max-width'), so short topics never get
+clipped while ACTIVITY absorbs whatever space remains."
+  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-%ds  %%s"
+          claude-dashboard-project-max-width branch-w topic-w))
 
 (defun claude-dashboard--instance-deploy-branch (inst)
   "Return the branch INST was deployed against, falling back to live."
@@ -1926,10 +1929,10 @@ segment intact, elides intermediate components with `…/'."
   (propertize
    (format (claude-dashboard--row-format branch-w topic-w)
            " " " " "PROJECT" "ST" "UP" "BRANCH"
-           "SESSION" "ACTIVITY" "TOPIC")
+           "SESSION" "TOPIC" "ACTIVITY")
    'face 'magit-section-heading))
 
-(defun claude-dashboard--format-instance-line (inst branch-w topic-w)
+(defun claude-dashboard--format-instance-line (inst branch-w topic-w activity-w)
   "Return a formatted single-line summary for INST."
   (let* ((status (claude-dashboard--status inst))
          (glyph (claude-dashboard--status-glyph status))
@@ -1959,7 +1962,8 @@ segment intact, elides intermediate components with `…/'."
          (sid (or (and sid-full (substring sid-full 0 8)) "—"))
          (activity-cell
           (truncate-string-to-width
-           (claude-dashboard--activity-cell cwd sid-full) 24 nil ?\s "…"))
+           (claude-dashboard--activity-cell cwd sid-full)
+           activity-w nil nil "…"))
          ;; Session-kind annotation: if the classifier says this row is
          ;; a monitor session, prepend `↻ ' to the project name (and
          ;; shrink its truncate budget by 2 so the column width stays
@@ -1993,22 +1997,11 @@ segment intact, elides intermediate components with `…/'."
             uptime
             (truncate-string-to-width branch branch-w nil ?\s "…")
             sid
-            activity-cell
-            ;; No padding char — keep the row's printed length equal
-            ;; to its actual content so it never overflows the window.
-            (truncate-string-to-width topic topic-w nil nil "…"))))
-
-(defcustom claude-dashboard-exchange-text-width 110
-  "Hard cap on the rendered width of a single line in the body."
-  :type 'integer :group 'claude-dashboard)
-
-(defun claude-dashboard--render-body-line (prefix text-face text)
-  "Insert one body line: PREFIX literally, then TEXT in TEXT-FACE."
-  (let* ((flat (replace-regexp-in-string
-                "[\t\n\r ]+" " " (string-trim text)))
-         (line (truncate-string-to-width
-                flat claude-dashboard-exchange-text-width nil nil "…")))
-    (insert prefix (propertize line 'face text-face) "\n")))
+            (truncate-string-to-width topic topic-w nil ?\s "…")
+            ;; ACTIVITY is the trailing column — already truncated to
+            ;; activity-w above with no padding char, so short activity
+            ;; cells don't pad the row past the window's right edge.
+            activity-cell)))
 
 (defun claude-dashboard--insert-query-section (xch)
   "Insert a magit subsection for one exchange XCH (`:user :asst :id').
@@ -2018,6 +2011,13 @@ Sections start collapsed; press TAB on the heading or `3' globally
 to reveal responses."
   (let* ((user-text (or (plist-get xch :user) ""))
          (asst-text (or (plist-get xch :asst) ""))
+         (win (get-buffer-window (current-buffer) 'visible))
+         (win-w (if win (window-text-width win) (frame-text-width)))
+         ;; Heading prefix is "    ❯ " (6 chars); body prefix is 6 spaces.
+         ;; Truncate each rendered line to the window's right edge with
+         ;; `…' so no row, query heading, or body line ever wraps.
+         (heading-w (max 16 (- win-w 6)))
+         (body-w (max 16 (- win-w 6)))
          (heading
           (concat "    "
                   (propertize "❯" 'face 'font-lock-keyword-face)
@@ -2025,19 +2025,22 @@ to reveal responses."
                   (propertize
                    (truncate-string-to-width
                     (replace-regexp-in-string "[\t\n\r ]+" " " user-text)
-                    claude-dashboard-exchange-text-width nil nil "…")
+                    heading-w nil nil "…")
                    'face 'default)))
          (section
           (magit-insert-section (claude-dashboard-query-section
                                  (plist-get xch :id) t)
             (magit-insert-heading heading)
             (when (> (length (string-trim asst-text)) 0)
-              (insert (propertize
-                       (replace-regexp-in-string
-                        "^" "      "
-                        (string-trim-right asst-text))
-                       'face 'shadow)
-                      "\n")))))
+              (let* ((lines (split-string (string-trim-right asst-text) "\n"))
+                     (rendered
+                      (mapconcat
+                       (lambda (l)
+                         (concat "      "
+                                 (truncate-string-to-width
+                                  l body-w nil nil "…")))
+                       lines "\n")))
+                (insert (propertize rendered 'face 'shadow) "\n"))))))
     (when (and section (oref section hidden))
       (magit-section-hide section))))
 
@@ -2059,7 +2062,7 @@ three progressive views: rows-only (1), rows + queries (2), rows
               (propertize "(no exchange yet)" 'face 'shadow)
               "\n"))))
 
-(defun claude-dashboard--insert-instance-section (inst branch-w topic-w)
+(defun claude-dashboard--insert-instance-section (inst branch-w topic-w activity-w)
   ;; Each instance row is the heading of a magit section whose body
   ;; is the per-instance overview.  TAB (inherited from
   ;; `magit-section-mode-map' as `magit-section-toggle') expands or
@@ -2068,7 +2071,8 @@ three progressive views: rows-only (1), rows + queries (2), rows
   (let ((section
          (magit-insert-section (claude-dashboard-instance-section inst t)
            (magit-insert-heading
-             (claude-dashboard--format-instance-line inst branch-w topic-w))
+             (claude-dashboard--format-instance-line
+              inst branch-w topic-w activity-w))
            (claude-dashboard--insert-instance-overview inst))))
     ;; The HIDE arg sets the slot but doesn't apply the invisibility
     ;; overlay; do that explicitly so the body actually starts folded.
@@ -2078,7 +2082,10 @@ three progressive views: rows-only (1), rows + queries (2), rows
 (defun claude-dashboard--render ()
   "Replace the current buffer's contents with a fresh dashboard."
   (let ((inhibit-read-only t)
-        (instances (claude-dashboard--instances-list)))
+        (instances (claude-dashboard--instances-list))
+        (cur-win (get-buffer-window (current-buffer) 'visible)))
+    (when cur-win
+      (setq claude-dashboard--last-rendered-width (window-text-width cur-win)))
     (erase-buffer)
     (magit-insert-section (claude-dashboard-section)
       (magit-insert-heading
@@ -2089,12 +2096,22 @@ three progressive views: rows-only (1), rows + queries (2), rows
              (branch-w (claude-dashboard--column-width
                         "BRANCH" branches
                         claude-dashboard-branch-max-width))
-             ;; M G PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) ACT(24)  TOPIC
+             (topics (mapcar #'claude-dashboard--instance-topic instances))
+             ;; TOPIC takes exactly the width of the longest current
+             ;; session name, capped by `topic-max-width' — so it never
+             ;; clips a topic that would otherwise fit, and never wastes
+             ;; horizontal space when topics are short.
+             (topic-w (claude-dashboard--column-width
+                       "TOPIC" topics
+                       claude-dashboard-topic-max-width))
+             ;; M G PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) TOPIC(T)  ACT
              (prefix-w (+ 1 1 1 1 claude-dashboard-project-max-width
-                            1 3 1 5 1 branch-w 1 8 1 24 2))
+                            1 3 1 5 1 branch-w 1 8 1 topic-w 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
-             (topic-w (max 16 (- frame-w prefix-w))))
+             ;; ACTIVITY absorbs whatever horizontal space is left, with
+             ;; a floor of 16 so it stays usable on narrow windows.
+             (activity-w (max 16 (- frame-w prefix-w))))
         (insert (claude-dashboard--header-line branch-w topic-w) "\n")
         (if (null instances)
             (insert "  (no instances — press N to launch)\n")
@@ -2115,7 +2132,7 @@ three progressive views: rows-only (1), rows + queries (2), rows
                                     0)))))))))
             (dolist (inst sorted)
               (claude-dashboard--insert-instance-section
-               inst branch-w topic-w))))))))
+               inst branch-w topic-w activity-w))))))))
 
 (defun claude-dashboard--fit-window (buf)
   "Shrink BUF's visible window to fit its content (when configured)."
@@ -2240,10 +2257,32 @@ on; nil otherwise (so `display-buffer' uses default rules)."
 ;; Reachable via `M-x claude-dashboard-restart' for the deliberate case.
 (define-key claude-dashboard-mode-map "r" nil)
 
+;; `global-visual-line-mode-enable-in-buffer' runs from
+;; `after-change-major-mode-hook' (after this mode's body), so a plain
+;; `(visual-line-mode -1)' inside the mode init gets silently undone.
+;; Filter the globalized enabler so it skips dashboard buffers — same
+;; pattern needed for any major mode that wants `truncate-lines' to win.
+(with-eval-after-load 'simple
+  (when (fboundp 'global-visual-line-mode-enable-in-buffer)
+    (advice-add 'global-visual-line-mode-enable-in-buffer :around
+                (lambda (orig &rest args)
+                  (unless (derived-mode-p 'claude-dashboard-mode)
+                    (apply orig args)))
+                '((name . claude-dashboard-skip)))))
+
 (define-derived-mode claude-dashboard-mode magit-section-mode "ClaudeDash"
   "Major mode for the Claude Code instance dashboard."
   :group 'claude-dashboard
+  ;; Rows are rendered to fit the window's current width exactly.
+  ;; `truncate-lines' keeps them on one line if the window narrows after
+  ;; render (e.g. user moves the frame to a smaller monitor); the
+  ;; resize hook below re-renders so content adapts to the new width.
   (setq-local truncate-lines t)
+  (setq-local word-wrap nil)
+  (when (bound-and-true-p visual-line-mode)
+    (visual-line-mode -1))
+  (add-hook 'window-size-change-functions
+            #'claude-dashboard--on-window-size-change nil t)
   (setq buffer-read-only t)
   (setq-local font-lock-defaults nil)
   (font-lock-mode -1)
@@ -2270,6 +2309,28 @@ on; nil otherwise (so `display-buffer' uses default rules)."
     (when (and (buffer-live-p buf)
                (get-buffer-window buf 'visible))
       (claude-dashboard--maybe-refresh))))
+
+(defvar-local claude-dashboard--last-rendered-width nil
+  "Window text width used for the most recent render of this buffer.
+Tracked per-buffer so the resize hook can no-op when nothing changed.")
+
+(defun claude-dashboard--on-window-size-change (frame)
+  "Re-render the dashboard when its window's text width changes on FRAME.
+Hooked into `window-size-change-functions' so the column layout
+adapts when the user moves the frame between monitors of different
+widths, splits the window, or resizes it manually."
+  (dolist (win (window-list frame 'no-mini))
+    (let ((buf (window-buffer win)))
+      (when (and (buffer-live-p buf)
+                 (eq (buffer-local-value 'major-mode buf)
+                     'claude-dashboard-mode))
+        (let ((new-w (window-text-width win))
+              (old-w (buffer-local-value 'claude-dashboard--last-rendered-width
+                                         buf)))
+          (when (and (integerp new-w) (or (null old-w) (/= new-w old-w)))
+            (with-current-buffer buf
+              (setq claude-dashboard--last-rendered-width new-w)
+              (claude-dashboard-refresh))))))))
 
 (defun claude-dashboard--goto-first-instance ()
   "Move point to the first instance row, or stay at top if none exist."
