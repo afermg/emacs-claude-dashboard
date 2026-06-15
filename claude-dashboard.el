@@ -389,10 +389,12 @@ Set to nil to let your usual window-management rules size it."
 
 (defcustom claude-dashboard-fit-max-height nil
   "Maximum number of lines the dashboard window may grow to.
-When nil, the dashboard is capped at half the frame's text height
-so expanded query sections never push the other windows into a
-sliver at the top.  An integer pins the cap to that many rows."
-  :type '(choice (const :tag "Half the frame height" nil) integer)
+When nil, the dashboard is sized to `2 + N' where N is the number
+of currently-tracked instances — so the window always shows the
+instance rows and nothing else, regardless of how many query
+sections happen to be expanded.  An integer pins the cap to that
+many rows instead."
+  :type '(choice (const :tag "Auto: 2 + N instances" nil) integer)
   :group 'claude-dashboard)
 
 (defcustom claude-dashboard-side 'bottom
@@ -2143,34 +2145,40 @@ three progressive views: rows-only (1), rows + queries (2), rows
                inst branch-w topic-w activity-w))))))))
 
 (defun claude-dashboard--fit-window (buf)
-  "Shrink BUF's visible window to fit its content (when configured)."
+  "Shrink BUF's visible window to fit its content (when configured).
+Sizes the window to just the instance rows (`2 + N': the summary
+line + column header + N instance rows) so expanded query
+sections don't make the side window swallow the frame.  The user
+can still scroll inside the dashboard to reach expanded bodies."
   (when claude-dashboard-fit-window
     (when-let ((win (get-buffer-window buf 'visible)))
       ;; Don't fit a window that's the only one in its frame — there's
       ;; nothing to shrink to.
       (unless (frame-root-window-p win)
         (with-selected-window win
-          ;; Cap max height so that with sections expanded the buffer's
-          ;; tall content doesn't push every other window into a 4-row
-          ;; strip; the dashboard then visually anchors at the bottom
-          ;; rather than swallowing the whole frame.
-          (let* ((frame-h (frame-text-lines (window-frame win)))
+          (let* ((n (length (claude-dashboard--instances-list)))
+                 (auto-h (+ 2 (max 1 n)))
                  (max-h (max claude-dashboard-fit-min-height
-                             (or claude-dashboard-fit-max-height
-                                 (/ frame-h 2)))))
+                             (or claude-dashboard-fit-max-height auto-h))))
             (fit-window-to-buffer
              win max-h claude-dashboard-fit-min-height nil nil t)))))))
 
 (defun claude-dashboard--display-action ()
   "Action argument for `display-buffer' that docks the dashboard.
 Returns a side-window action when `claude-dashboard-fit-window' is
-on; nil otherwise (so `display-buffer' uses default rules)."
+on; nil otherwise (so `display-buffer' uses default rules).
+`no-delete-other-windows' is explicitly cleared so `C-x 1' from a
+sibling window and `C-x 0' from the dashboard window itself both
+remove it from sight; without this override
+`display-buffer-in-side-window' sets the parameter to t and the
+side window survives both commands."
   (when claude-dashboard-fit-window
     `((display-buffer-in-side-window)
       (side          . ,claude-dashboard-side)
       (slot          . 0)
       (window-height . fit-window-to-buffer)
-      (preserve-size . (nil . t)))))
+      (preserve-size . (nil . t))
+      (window-parameters . ((no-delete-other-windows . nil))))))
 
 (defun claude-dashboard--maybe-refresh ()
   "Re-render the dashboard if its buffer is live."
