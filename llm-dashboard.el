@@ -2741,7 +2741,14 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
                    (text (and pdata (alist-get 'text pdata)))
                    (ts-ms (nth 2 r))
                    (ts (when (numberp ts-ms) (/ ts-ms 1000.0))))
-              (when (and role (equal ptype "text")
+              ;; Accept `text' parts always, and `reasoning' parts for
+              ;; assistant turns — opencode emits the chain-of-thought
+              ;; as `reasoning' and only sometimes a final `text', so
+              ;; activity columns are near-empty if reasoning is dropped.
+              (when (and role
+                         (or (equal ptype "text")
+                             (and (eq role 'assistant)
+                                  (equal ptype "reasoning")))
                          (stringp text)
                          (> (length (string-trim text)) 0))
                 (push `((role . ,role)
