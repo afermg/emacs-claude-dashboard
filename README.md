@@ -90,12 +90,13 @@ directories from `recentf-list`, then a free-form `read-directory-name`.
 
 The dashboard multiplexes over backend CLIs that share the same shape
 (a TUI agent, a per-user state directory, a `--resume` / `--continue`
-convention). Two are wired up out of the box:
+convention). Three are wired up out of the box:
 
-| Backend  | Program    | State dir                       | Status                              |
-| -------- | ---------- | ------------------------------- | ----------------------------------- |
-| `claude` | `claude`   | `~/.claude`                     | Default; full feature set.          |
-| `opencode` | `opencode` | `~/.local/share/opencode`       | Process / launch / manifest / resume; transcript-derived columns (topic, model, last activity, exchange body, kind-classifier) currently stub out because opencode's on-disk schema is SQLite, not Claude's per-session JSONL. |
+| Backend    | Program    | State dir                  | Transcripts | Status                                       |
+| ---------- | ---------- | -------------------------- | ----------- | -------------------------------------------- |
+| `claude`   | `claude`   | `~/.claude`                | JSONL       | Full support; default; includes kind classifier. |
+| `opencode` | `opencode` | `~/.local/share/opencode`  | SQLite      | Full support — sessions, topic, activity, exchange body via the built-in SQLite reader. No `/rename` (opencode lacks the slash command). Requires Emacs built with `--with-sqlite3` (Emacs 30 default). |
+| `codex`    | `codex`    | `~/.codex`                 | Rollout JSONL | Full support — session discovery, topic, activity, and `/rename` via split-write. Topic falls back to the worktree slug since codex has no live name file. |
 
 Switch with a single defcustom:
 
@@ -103,9 +104,21 @@ Switch with a single defcustom:
 ;; Default — Claude Code
 (setq claude-dashboard-backend 'claude)
 
-;; Or opt in to opencode
+;; Or opt in
 (setq claude-dashboard-backend 'opencode)
+(setq claude-dashboard-backend 'codex)
 ```
+
+`claude-dashboard-backend` only controls the **default** for new
+sessions. Each instance captures its backend symbol at launch time
+into a `:backend` struct slot and persists it in the manifest, so a
+single dashboard can mix claude / opencode / codex rows side by side —
+every row dispatches its own session-id, topic, activity, and rename
+through the adapter it was launched against.
+
+Each row's TOPIC column gets a one-glyph colored badge — `C` for
+claude, `O` for opencode, `X` for codex — so multi-backend dashboards
+are visually distinguishable without an extra column.
 
 The `claude-dashboard-program`, `claude-dashboard-claude-dir`,
 `claude-dashboard-spinner-regexp`, and `claude-dashboard-manifest-file`
@@ -114,10 +127,28 @@ which is useful for pinning an absolute path or sharing a manifest
 across backends. Leave them at their nil / `auto` defaults to let the
 active backend supply the value.
 
-Adding a new backend means adding an entry to `claude-dashboard-backends`
-with `:program`, `:state-dir`, `:spinner-regexp`, `:resume-flag`,
-`:continue-flag`, `:worktree-subdir`, and `:transcript-style`. See the
-`claude-dashboard-backends` docstring for the full key list.
+### Adding a new backend
+
+Append an entry to `claude-dashboard-backends`. The static keys are
+`:program`, `:state-dir`, `:spinner-regexp`, `:resume-flag`,
+`:continue-flag`, `:worktree-subdir`, `:transcript-style`, `:badge`,
+`:badge-color`, and `:supports-auto-name`.
+
+The function-valued keys (each a symbol naming a defun, or `nil` to
+opt out) drive the per-row column extractors:
+
+| Slot                  | Signature                | Purpose                                            |
+| --------------------- | ------------------------ | -------------------------------------------------- |
+| `:session-id-fn`      | `(inst) → sid \| nil`    | Discover the live session-id for INST.             |
+| `:session-name-fn`    | `(inst) → name \| nil`   | Live user-set name (post-`/rename`).               |
+| `:transcript-path-fn` | `(cwd sid) → path \| nil`| Locate the transcript for a given session.         |
+| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives ACTIVITY, exchanges, first-prompt, turn-counts. |
+| `:list-sessions-fn`   | `() → list-of-past`      | Resumable session enumeration for the picker.      |
+| `:rename-fn`          | `(proc slug) → bool`     | Inject a rename command; `nil` means unsupported.  |
+
+See the `claude-dashboard-backends` docstring for the complete shape
+and the `--claude-*-fn` / `--opencode-*-fn` / `--codex-*-fn`
+implementations for working examples.
 
 ## Behavior notes
 

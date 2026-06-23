@@ -47,12 +47,15 @@
 (defcustom claude-dashboard-backend 'claude
   "Active backend CLI for the dashboard.
 A symbol whose `assq' lookup against `claude-dashboard-backends'
-yields the running backend's plist.  Claude is the default and
-the only fully-supported backend; `opencode' is wired up at the
-process/manifest level but its transcript-derived columns are
-stubbed out until the schema is mapped."
+yields the running backend's plist.  Claude is the default; the
+other shipped backends are `opencode' (SQLite transcripts) and
+`codex' (rollout JSONL).  Per-instance backend is captured at
+launch time and stored on the instance struct, so changing this
+defcustom only affects *new* sessions — existing rows keep
+dispatching through the backend they were launched against."
   :type '(choice (const :tag "Claude Code" claude)
                  (const :tag "opencode" opencode)
+                 (const :tag "codex" codex)
                  (symbol :tag "Other"))
   :group 'claude-dashboard)
 
@@ -64,7 +67,16 @@ stubbed out until the schema is mapped."
      :resume-flag      "--resume"
      :continue-flag    "--continue"
      :worktree-subdir  ".claude/worktrees"
-     :transcript-style jsonl)
+     :transcript-style jsonl
+     :badge            "C"
+     :badge-color      "#61afef"
+     :supports-auto-name t
+     :session-id-fn    claude-dashboard--claude-session-id-fn
+     :session-name-fn  claude-dashboard--claude-session-name-fn
+     :transcript-path-fn claude-dashboard--claude-transcript-path-fn
+     :transcript-walk-fn claude-dashboard--claude-transcript-walk-fn
+     :list-sessions-fn claude-dashboard--claude-list-sessions-fn
+     :rename-fn        claude-dashboard--claude-rename-fn)
     (opencode
      :program          "opencode"
      :state-dir        ,(expand-file-name "~/.local/share/opencode")
@@ -76,9 +88,36 @@ stubbed out until the schema is mapped."
      :resume-flag      "--session"
      :continue-flag    "--continue"
      :worktree-subdir  ".opencode/worktrees"
-     :transcript-style sqlite))
+     :transcript-style sqlite
+     :badge            "O"
+     :badge-color      "#e5c07b"
+     :supports-auto-name nil
+     :session-id-fn    claude-dashboard--opencode-session-id-fn
+     :session-name-fn  claude-dashboard--opencode-session-name-fn
+     :transcript-path-fn claude-dashboard--opencode-transcript-path-fn
+     :transcript-walk-fn claude-dashboard--opencode-transcript-walk-fn
+     :list-sessions-fn claude-dashboard--opencode-list-sessions-fn
+     :rename-fn        nil)
+    (codex
+     :program          "codex"
+     :state-dir        ,(expand-file-name "~/.codex")
+     :spinner-regexp   "esc to interrupt\\|Working\\|Thinking"
+     :resume-flag      "resume"
+     :continue-flag    "resume"
+     :worktree-subdir  ".codex/worktrees"
+     :transcript-style rollout
+     :badge            "X"
+     :badge-color      "#98c379"
+     :supports-auto-name t
+     :session-id-fn    claude-dashboard--codex-session-id-fn
+     :session-name-fn  claude-dashboard--codex-session-name-fn
+     :transcript-path-fn claude-dashboard--codex-transcript-path-fn
+     :transcript-walk-fn claude-dashboard--codex-transcript-walk-fn
+     :list-sessions-fn claude-dashboard--codex-list-sessions-fn
+     :rename-fn        claude-dashboard--codex-rename-fn))
   "Registry of supported backend CLIs.
-Each entry is `(NAME . PLIST)' where PLIST has at least:
+Each entry is `(NAME . PLIST)' where PLIST has at least the
+following static slots:
 
   :program          Executable name used to launch a session.
   :state-dir        Per-user state directory the backend writes to.
@@ -88,9 +127,30 @@ Each entry is `(NAME . PLIST)' where PLIST has at least:
   :worktree-subdir  Relative path under the main worktree where new
                     branch worktrees are created.
   :transcript-style Symbol describing how this backend stores session
-                    transcripts (`jsonl' = Claude's per-session jsonl
-                    files under projects/<slug>/; other values are
-                    treated by transcript helpers as opaque/stubbed)."
+                    transcripts (`jsonl' for claude, `sqlite' for
+                    opencode, `rollout' for codex).
+  :badge            One-glyph backend tag rendered before TOPIC.
+  :badge-color      Hex color for the badge.
+  :supports-auto-name  Whether the auto-`/name'-after-N-turns workflow
+                    is relevant for this backend.
+
+And these function slots (each a SYMBOL naming a defun, or nil
+for unsupported):
+
+  :session-id-fn    (INST) → SID string or nil.  Live session-id
+                    discovery for the running INST (typically from
+                    per-PID state, or by mtime-scanning the state dir
+                    for the freshest session whose cwd matches).
+  :session-name-fn  (INST) → user-set name (post-`/rename') or nil.
+  :transcript-path-fn (CWD SID) → transcript file path or nil.
+  :transcript-walk-fn (PATH) → list of normalized messages, each an
+                    alist `((role . SYM) (text . STR) (ts . FLOAT)
+                            (raw . OBJ))', iterated chronologically.
+                    Backend-agnostic column extractors consume this.
+  :list-sessions-fn () → list of `claude-dashboard-past-session'
+                    structs, newest-first.
+  :rename-fn        (PROC SLUG) → non-nil on successful injection;
+                    nil when the backend has no rename slash command."
   :type '(alist :key-type symbol
                 :value-type (plist :key-type symbol :value-type sexp))
   :group 'claude-dashboard)
@@ -104,6 +164,44 @@ Each entry is `(NAME . PLIST)' where PLIST has at least:
 (defun claude-dashboard--backend-prop (key &optional name)
   "Look up KEY in backend NAME's plist (or the active backend's)."
   (plist-get (claude-dashboard--backend-plist name) key))
+
+(defun claude-dashboard--backend-call (slot backend &rest args)
+  "Invoke BACKEND's SLOT function with ARGS, returning its result or nil.
+SLOT must name a function-slot (e.g. `:session-id-fn').  When the
+slot is nil or its function is not bound the call is a no-op."
+  (let ((fn (claude-dashboard--backend-prop slot backend)))
+    (when (and fn (fboundp fn))
+      (apply fn args))))
+
+(defun claude-dashboard--instance-backend (inst)
+  "Return INST's backend symbol, falling back to the active default."
+  (or (and (claude-dashboard-instance-p inst)
+           (claude-dashboard-instance-backend inst))
+      claude-dashboard-backend))
+
+(defun claude-dashboard--inst-transcript-path (inst &optional sid)
+  "Return INST's session transcript path via its backend, or nil.
+SID defaults to the live session-id (falling back to the cached
+struct slot)."
+  (let* ((backend (claude-dashboard--instance-backend inst))
+         (sid (or sid
+                  (and (fboundp 'claude-dashboard--live-session-id)
+                       (claude-dashboard--live-session-id inst))
+                  (claude-dashboard-instance-session-id inst)))
+         (cwd (claude-dashboard-instance-cwd inst)))
+    (and sid (claude-dashboard--backend-call
+              :transcript-path-fn backend cwd sid))))
+
+(defun claude-dashboard--inst-walk-messages (inst &optional sid)
+  "Return a chronological normalized message list for INST's session.
+Each element is an alist `((role . SYM) (text . STR) (ts . FLOAT)
+\(raw . OBJ))'.  Dispatches through the backend's
+`:transcript-walk-fn'.  Returns nil when the transcript path can't
+be resolved or the backend has no walker."
+  (when-let* ((path (claude-dashboard--inst-transcript-path inst sid)))
+    (claude-dashboard--backend-call
+     :transcript-walk-fn (claude-dashboard--instance-backend inst)
+     path)))
 
 (defcustom claude-dashboard-program nil
   "Executable used to launch a backend instance.
@@ -156,6 +254,12 @@ pin it regardless of the active backend."
 (cl-defstruct claude-dashboard-instance
   buffer cwd started-at last-output
   session-id model
+  ;; Backend symbol (`claude', `opencode', `codex', ...) captured at launch
+  ;; so per-row dispatch sees the backend the agent was actually started
+  ;; against, even if the user later flips `claude-dashboard-backend' for
+  ;; the next session.  Defaults to `claude' for legacy manifest entries
+  ;; that pre-date this slot.
+  (backend 'claude)
   branch-cache worktree-cache main-worktree-cache last-prompt-cache
   project-name-cache)
 
@@ -259,16 +363,10 @@ and is returned; otherwise the walk completes and nil is returned."
             (forward-line 1)))
         nil))))
 
-(defun claude-dashboard--count-user-turns (cwd sid)
-  "Return the number of `type:user' entries in SID's transcript, or 0."
-  (let ((n 0))
-    (claude-dashboard--map-jsonl-entries
-     (claude-dashboard--transcript-file-for-sid sid cwd)
-     (lambda (entry)
-       (when (equal "user" (alist-get 'type entry))
-         (setq n (1+ n)))
-       nil))
-    n))
+(defun claude-dashboard--count-user-turns (inst)
+  "Return the number of user-role entries in INST's transcript, or 0."
+  (cl-count-if (lambda (m) (eq (alist-get 'role m) 'user))
+               (claude-dashboard--inst-walk-messages inst)))
 
 (defun claude-dashboard--kebab-from-prompt (prompt)
   "Turn PROMPT into a short kebab-case slug suitable for `/name'."
@@ -295,35 +393,40 @@ and is returned; otherwise the walk completes and nil is returned."
         (substring slug 0 (min 30 (length slug)))))))
 
 (defun claude-dashboard--maybe-auto-name (inst)
-  "Send `/name <slug>' to INST when it is `idle' and ready for one.
+  "Send `/name <slug>' (or backend equivalent) to INST when ready.
 Worktree-launched instances use their registered branch name on first
 idle; otherwise we wait `claude-dashboard-auto-name-after-turns' user
-turns and derive a slug from the first prompt.  Fires once per buffer."
+turns and derive a slug from the first prompt.  No-ops for backends
+whose `:supports-auto-name' slot is nil or whose `:rename-fn' is
+absent.  Fires once per buffer."
   (let* ((buf (claude-dashboard-instance-buffer inst))
          (cwd (claude-dashboard-instance-cwd inst))
+         (backend (claude-dashboard--instance-backend inst))
          (sid (or (claude-dashboard--live-session-id inst)
                   (claude-dashboard-instance-session-id inst)))
          (proc (claude-dashboard--instance-process inst))
          (preassigned (and buf (gethash buf claude-dashboard--worktree-names))))
     (when (and buf (buffer-live-p buf) cwd proc (process-live-p proc)
+               (claude-dashboard--backend-prop :supports-auto-name backend)
+               (claude-dashboard--backend-prop :rename-fn backend)
                (not (gethash buf claude-dashboard--name-injected))
                (eq (claude-dashboard--status inst) 'idle)
                (or preassigned
                    (and claude-dashboard-auto-name-after-turns
                         sid
                         (null (claude-dashboard--session-name-from-transcript
-                               cwd sid))
-                        (>= (claude-dashboard--count-user-turns cwd sid)
+                               inst sid))
+                        (>= (claude-dashboard--count-user-turns inst)
                             claude-dashboard-auto-name-after-turns))))
       (let ((slug (or preassigned
                       (claude-dashboard--kebab-from-prompt
                        (claude-dashboard--first-prompt-from-transcript
-                        cwd sid)))))
+                        inst)))))
         (when (and slug (not (string-empty-p slug)))
           (puthash buf t claude-dashboard--name-injected)
-          (process-send-string proc (format "/name %s\n" slug))
-          (message "claude-dashboard: named %s → %s"
-                   (buffer-name buf) slug))))))
+          (when (claude-dashboard--backend-call :rename-fn backend proc slug)
+            (message "claude-dashboard: named %s → %s"
+                     (buffer-name buf) slug)))))))
 
 (defun claude-dashboard-copy-topic ()
   "Copy the topic of the instance at point to the kill ring.
@@ -340,29 +443,30 @@ auto-assigned slug as the last fallback."
       (user-error "No topic available for this instance"))))
 
 (defun claude-dashboard-name-instance ()
-  "Manually send `/name <slug>' to the instance at point.
-Prompts for a name (default derived from the session's first
-user prompt).  Useful when you want to override or backfill."
+  "Manually send a rename command to the instance at point.
+Prompts for a name (default derived from the session's first user
+prompt).  Dispatches through the active backend's `:rename-fn';
+signals when the backend does not support renaming."
   (interactive)
   (let* ((inst (claude-dashboard--current-instance))
-         (cwd (claude-dashboard-instance-cwd inst))
-         (sid (or (claude-dashboard--live-session-id inst)
-                  (claude-dashboard-instance-session-id inst)))
-         (default (or (and cwd sid
-                           (claude-dashboard--kebab-from-prompt
-                            (claude-dashboard--first-prompt-from-transcript
-                             cwd sid)))
+         (backend (claude-dashboard--instance-backend inst))
+         (default (or (claude-dashboard--kebab-from-prompt
+                       (claude-dashboard--first-prompt-from-transcript inst))
                       ""))
-         (name (read-string (format "/name (default %s): " default)
+         (name (read-string (format "rename (default %s): " default)
                             nil nil default))
          (proc (claude-dashboard--instance-process inst)))
     (unless (and proc (process-live-p proc))
       (user-error "Instance has no live process"))
-    (process-send-string proc (format "/name %s\n" name))
-    (puthash (claude-dashboard-instance-buffer inst) t
-             claude-dashboard--name-injected)
-    (message "Sent /name %s to %s" name
-             (buffer-name (claude-dashboard-instance-buffer inst)))))
+    (unless (claude-dashboard--backend-prop :rename-fn backend)
+      (user-error "Backend %s does not support renaming" backend))
+    (if (claude-dashboard--backend-call :rename-fn backend proc name)
+        (progn
+          (puthash (claude-dashboard-instance-buffer inst) t
+                   claude-dashboard--name-injected)
+          (message "Sent rename %s to %s" name
+                   (buffer-name (claude-dashboard-instance-buffer inst))))
+      (user-error "Rename injection failed"))))
 
 ;;; --- Phase classification ------------------------------------------------
 ;;
@@ -572,11 +676,15 @@ Each threshold met contributes 1 to a 0–4 score; the verdict is
 
 (defun claude-dashboard--instance-kind (inst)
   "Return INST's session kind (`monitor' or `code'), cached.
-Returns nil for sessions with insufficient data."
-  (when-let* ((sid (or (claude-dashboard--live-session-id inst)
-                       (claude-dashboard-instance-session-id inst))))
-    (let ((cur (gethash sid claude-dashboard--kind-cache))
-          (now (float-time)))
+Returns nil for sessions with insufficient data, or for backends
+other than Claude (the classifier mines Claude's tool_use entries
+and has no equivalent for opencode/codex)."
+  (when (and (eq (claude-dashboard--instance-backend inst) 'claude)
+             (claude-dashboard--live-session-id inst))
+    (let* ((sid (or (claude-dashboard--live-session-id inst)
+                    (claude-dashboard-instance-session-id inst)))
+           (cur (gethash sid claude-dashboard--kind-cache))
+           (now (float-time)))
       (if (and cur (< (- now (cdr cur))
                       claude-dashboard-kind-cache-ttl))
           (car cur)
@@ -802,14 +910,17 @@ separators, so e.g. `/home/me/projects/gsk_broad/' becomes
            (directory-file-name (string-trim-left cwd "/")))))
 
 (defun claude-dashboard--enrich-instance (inst)
-  "Fill in session-id and model on INST from on-disk session metadata."
-  (let* ((proc (claude-dashboard--instance-process inst))
-         (pid (and proc (process-id proc)))
-         (json (and pid (claude-dashboard--read-session-json pid))))
-    (when json
-      (when-let ((sid (alist-get 'sessionId json)))
-        (setf (claude-dashboard-instance-session-id inst) sid)))
-    (unless (claude-dashboard-instance-model inst)
+  "Fill in session-id (and Claude's model) on INST from on-disk metadata.
+Session-id discovery dispatches through the backend's
+`:session-id-fn'.  Model extraction remains Claude-specific
+because opencode and codex don't store a `message.model' field
+the same way."
+  (let ((backend (claude-dashboard--instance-backend inst)))
+    (when-let ((sid (claude-dashboard--backend-call
+                     :session-id-fn backend inst)))
+      (setf (claude-dashboard-instance-session-id inst) sid))
+    (when (and (eq backend 'claude)
+               (not (claude-dashboard-instance-model inst)))
       (let* ((cwd (claude-dashboard-instance-cwd inst))
              (proj-dir (expand-file-name
                         (format "projects/%s"
@@ -908,89 +1019,86 @@ Result is a plist (:name STR :input ALIST)."
                    "\\`[ \t#*>`-]+" "" first-sent)))
       (and (> (length clean) 0) clean))))
 
-(defun claude-dashboard--activity-cell (cwd sid)
-  "Return a short summary of the agent's most recent activity.
-Walks SID's transcript bottom-up and returns the first sentence of
-the latest assistant text content, OR a `<Tool> <hint>' summary
-when the very last assistant content item is a tool_use rather
-than prose.  Falls back to `—' when no assistant turn exists yet."
-  (or (claude-dashboard--map-jsonl-entries
-       (claude-dashboard--transcript-file-for-sid sid cwd)
-       (lambda (entry)
-         (when (equal "assistant" (alist-get 'type entry))
-           (let ((content (and (alist-get 'message entry)
-                               (alist-get 'content
-                                          (alist-get 'message entry)))))
-             (when (listp content)
-               (cl-some
-                (lambda (c)
-                  (let ((ctype (alist-get 'type c)))
-                    (cond
-                     ((equal "text" ctype)
-                      (claude-dashboard--first-sentence
-                       (alist-get 'text c)))
-                     ((equal "tool_use" ctype)
-                      (let* ((name (alist-get 'name c))
-                             (hint (claude-dashboard--tool-hint
-                                    name (alist-get 'input c))))
-                        (if (and hint (stringp hint)
-                                 (> (length hint) 0))
-                            (format "%s %s" name hint)
-                          name))))))
-                (reverse content))))))
-       t)
-      "—"))
+(defun claude-dashboard--activity-cell (inst)
+  "Return a short summary of INST's most recent agent activity.
+For Claude, walks the JSONL bottom-up and returns the first
+sentence of the latest assistant text content, OR a `<Tool>
+<hint>' summary when the very last assistant content item is a
+tool_use rather than prose.  For other backends, returns the
+first sentence of the most recent assistant message from the
+normalized walker.  Falls back to `—' when no assistant turn
+exists yet."
+  (let* ((backend (claude-dashboard--instance-backend inst))
+         (cwd (claude-dashboard-instance-cwd inst))
+         (sid (or (claude-dashboard--live-session-id inst)
+                  (claude-dashboard-instance-session-id inst))))
+    (or (and (eq backend 'claude)
+             (claude-dashboard--map-jsonl-entries
+              (claude-dashboard--transcript-file-for-sid sid cwd)
+              (lambda (entry)
+                (when (equal "assistant" (alist-get 'type entry))
+                  (let ((content (and (alist-get 'message entry)
+                                      (alist-get 'content
+                                                 (alist-get 'message entry)))))
+                    (when (listp content)
+                      (cl-some
+                       (lambda (c)
+                         (let ((ctype (alist-get 'type c)))
+                           (cond
+                            ((equal "text" ctype)
+                             (claude-dashboard--first-sentence
+                              (alist-get 'text c)))
+                            ((equal "tool_use" ctype)
+                             (let* ((name (alist-get 'name c))
+                                    (hint (claude-dashboard--tool-hint
+                                           name (alist-get 'input c))))
+                               (if (and hint (stringp hint)
+                                        (> (length hint) 0))
+                                   (format "%s %s" name hint)
+                                 name))))))
+                       (reverse content))))))
+              t))
+        ;; Generic path for non-Claude backends: first sentence of the
+        ;; latest assistant message from the normalized walker.
+        (when-let* ((msgs (claude-dashboard--inst-walk-messages inst))
+                    (last-asst (cl-some
+                                (lambda (m)
+                                  (and (eq (alist-get 'role m) 'assistant)
+                                       (alist-get 'text m)))
+                                (reverse msgs))))
+          (claude-dashboard--first-sentence last-asst))
+        "—")))
 
-(defun claude-dashboard--all-exchanges (cwd sid)
-  "Return every (:user STR :asst STR :id STR) exchange in SID's transcript.
-Walked top-down so the result is chronological.  An exchange is
-opened on each non-meta `user' message whose content has visible
-text; subsequent assistant text content is appended to that
-exchange's :asst (multiple assistant turns between two user turns
-are concatenated with a blank line)."
+(defun claude-dashboard--all-exchanges (inst)
+  "Return every (:user STR :asst STR :id STR) exchange in INST's session.
+Walked top-down so the result is chronological.  Uses INST's
+backend `:transcript-walk-fn' for backend-agnostic message access.
+An exchange is opened on each user message; subsequent assistant
+messages are concatenated with a blank line into its :asst."
   (let (exchanges current)
-    (claude-dashboard--map-jsonl-entries
-     (claude-dashboard--transcript-file-for-sid sid cwd)
-     (lambda (entry)
-       (let ((type (alist-get 'type entry))
-             (msg (alist-get 'message entry))
-             (is-meta (alist-get 'isMeta entry))
-             (pid (alist-get 'promptId entry)))
-         (cond
-          ((and (equal "user" type) (not is-meta))
-           (let* ((content (and msg (alist-get 'content msg)))
-                  (txt (cond
-                        ((stringp content) content)
-                        ((listp content)
-                         (when-let ((it (cl-find-if
-                                         (lambda (c)
-                                           (equal "text"
-                                                  (alist-get 'type c)))
-                                         content)))
-                           (alist-get 'text it))))))
-             (when (and txt (stringp txt)
-                        (not (string-prefix-p "<" txt))
-                        (> (length (string-trim txt)) 0))
-               (when current (push current exchanges))
-               (setq current
-                     (list :user (string-trim txt)
-                           :asst nil
-                           :id (or pid (md5 txt)))))))
-          ((and (equal "assistant" type) current)
-           (let ((content (and msg (alist-get 'content msg))))
-             (when (listp content)
-               (dolist (c content)
-                 (when (equal "text" (alist-get 'type c))
-                   (let ((txt (alist-get 'text c)))
-                     (when (and txt (> (length (string-trim txt)) 0))
-                       (let ((prior (plist-get current :asst))
-                             (new (string-trim txt)))
-                         (setq current
-                               (plist-put current :asst
-                                          (if prior
-                                              (concat prior "\n\n" new)
-                                            new)))))))))))))
-       nil))
+    (dolist (m (claude-dashboard--inst-walk-messages inst))
+      (let* ((role (alist-get 'role m))
+             (txt (alist-get 'text m))
+             (raw (alist-get 'raw m))
+             (pid (and (listp raw) (alist-get 'promptId raw))))
+        (cond
+         ((and (eq role 'user) txt
+               (not (string-prefix-p "<" txt))
+               (> (length (string-trim txt)) 0))
+          (when current (push current exchanges))
+          (setq current
+                (list :user (string-trim txt)
+                      :asst nil
+                      :id (or pid (md5 txt)))))
+         ((and (eq role 'assistant) current txt
+               (> (length (string-trim txt)) 0))
+          (let ((prior (plist-get current :asst))
+                (new (string-trim txt)))
+            (setq current
+                  (plist-put current :asst
+                             (if prior
+                                 (concat prior "\n\n" new)
+                               new))))))))
     (when current (push current exchanges))
     (nreverse exchanges)))
 
@@ -1119,34 +1227,11 @@ the first user-typed prompt found, truncated to 80 chars."
                  (if (> (length s) 80) (concat (substring s 0 77) "...") s))))))
 
 (defun claude-dashboard--past-sessions ()
-  "Scan the backend's projects/ tree and return `claude-dashboard-past-session's.
-Sorted by mtime, newest first.  Only meaningful for backends with
-`:transcript-style' = `jsonl' (e.g. claude); other backends return
-nil because their on-disk schema isn't mapped here yet."
-  (let* ((root (expand-file-name "projects" (claude-dashboard--state-dir)))
-         (acc '()))
-    (when (file-directory-p root)
-      (dolist (proj-dir (directory-files root t "^[^.]" t))
-        (when (file-directory-p proj-dir)
-          (dolist (jsonl (directory-files proj-dir t "\\.jsonl\\'" t))
-            (let* ((bn (file-name-nondirectory jsonl))
-                   (sid (file-name-sans-extension bn))
-                   (mtime (file-attribute-modification-time
-                           (file-attributes jsonl)))
-                   (info (claude-dashboard--read-jsonl-cwd-and-prompt jsonl))
-                   (cwd (car info))
-                   (prompt (cdr info)))
-              (when cwd
-                (push (make-claude-dashboard-past-session
-                       :session-id sid
-                       :cwd cwd
-                       :mtime mtime
-                       :first-prompt prompt
-                       :jsonl-path jsonl)
-                      acc)))))))
-    (sort acc (lambda (a b)
-                (time-less-p (claude-dashboard-past-session-mtime b)
-                             (claude-dashboard-past-session-mtime a))))))
+  "Return past sessions for the active backend, newest first.
+Dispatches through the backend's `:list-sessions-fn'."
+  (or (claude-dashboard--backend-call
+       :list-sessions-fn claude-dashboard-backend)
+      '()))
 
 (defun claude-dashboard--read-past-session (&optional default-cwd)
   "Prompt for a past session via `completing-read'.
@@ -1254,14 +1339,16 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
       (file-name-as-directory (match-string 1 cwd))
     cwd))
 
-(defun claude-dashboard--register (buffer cwd)
-  "Insert BUFFER as an instance rooted at CWD into the registry."
+(defun claude-dashboard--register (buffer cwd &optional backend)
+  "Insert BUFFER as an instance rooted at CWD into the registry.
+BACKEND defaults to the currently-active `claude-dashboard-backend'."
   (let* ((cwd (claude-dashboard--normalize-cwd cwd))
          (inst (make-claude-dashboard-instance
                 :buffer buffer
                 :cwd cwd
                 :started-at (float-time)
-                :last-output (float-time)))
+                :last-output (float-time)
+                :backend (or backend claude-dashboard-backend)))
          (deploy-branch (claude-dashboard--git-branch cwd)))
     (puthash buffer inst claude-dashboard--instances)
     (when deploy-branch
@@ -1307,10 +1394,13 @@ explicit file path to pin it."
     (path  path)))
 
 (defun claude-dashboard--write-manifest ()
-  "Persist (cwd, sid) for each registered instance to the manifest file.
+  "Persist (cwd, sid, backend) for each registered instance.
 Safe to call any number of times; entries without a resolved sid
 are written too (sid = nil) so `--resume-all' can attempt to look
-them up at recovery time, but they're best-effort."
+them up at recovery time, but they're best-effort.  The `:backend'
+field lets resume reconstruct each row with the same adapter the
+instance was originally launched against; entries from older
+manifests without `:backend' are treated as `claude' at read time."
   (when-let ((manifest-file (claude-dashboard--manifest-path)))
     (let ((entries
            (cl-loop for inst in (claude-dashboard--instances-list)
@@ -1318,8 +1408,10 @@ them up at recovery time, but they're best-effort."
                     for sid = (or (and (fboundp 'claude-dashboard--live-session-id)
                                        (claude-dashboard--live-session-id inst))
                                   (claude-dashboard-instance-session-id inst))
+                    for backend = (claude-dashboard--instance-backend inst)
                     when cwd
                     collect (list :cwd cwd :sid sid
+                                  :backend backend
                                   :recorded (current-time)))))
       (let ((dir (file-name-directory manifest-file)))
         (when (and dir (not (file-directory-p dir)))
@@ -1341,13 +1433,14 @@ them up at recovery time, but they're best-effort."
 
 ;;;###autoload
 (defun claude-dashboard-resume-all ()
-  "Relaunch every session in the manifest via `claude --resume <sid>'.
-For each entry (:cwd :sid) in `claude-dashboard-manifest-file':
+  "Relaunch every session in the manifest via its backend's resume flag.
+For each entry (:cwd :sid :backend) in `claude-dashboard-manifest-file':
 - if its cwd is gone, skip;
 - if no sid, skip (nothing to resume);
 - if an instance for that cwd is already running in the dashboard,
   skip (avoid duplicate launches);
-- otherwise fire `--launch CWD (\"--resume\" SID)'.
+- otherwise launch via that backend's `:program' + `:resume-flag'.
+Entries without `:backend' (older manifests) default to `claude'.
 Asks for confirmation before launching so a stale manifest from
 weeks ago doesn't surprise you."
   (interactive)
@@ -1358,10 +1451,11 @@ weeks ago doesn't surprise you."
           (cl-loop for e in entries
                    for cwd = (plist-get e :cwd)
                    for sid = (plist-get e :sid)
+                   for backend = (or (plist-get e :backend) 'claude)
                    when (and cwd sid
                              (file-directory-p cwd)
                              (not (member cwd live-cwds)))
-                   collect (cons cwd sid))))
+                   collect (list :cwd cwd :sid sid :backend backend))))
     (cond
      ((null entries)
       (message "claude-dashboard: manifest is empty (or unreadable)"))
@@ -1370,9 +1464,11 @@ weeks ago doesn't surprise you."
      ((y-or-n-p (format "Resume %d session(s) from manifest? "
                         (length candidates)))
       (dolist (c candidates)
-        (claude-dashboard--launch
-         (car c)
-         (list (claude-dashboard--backend-prop :resume-flag) (cdr c))))
+        (let ((claude-dashboard-backend (plist-get c :backend)))
+          (claude-dashboard--launch
+           (plist-get c :cwd)
+           (list (claude-dashboard--backend-prop :resume-flag)
+                 (plist-get c :sid)))))
       (message "claude-dashboard: resumed %d session(s)" (length candidates))))))
 
 (defun claude-dashboard--launch (cwd extra-args)
@@ -1719,91 +1815,61 @@ in a single per-user history file; other backends return nil."
        (and (equal sid (alist-get 'sessionId entry))
             (alist-get 'display entry))))))
 
-(defun claude-dashboard--transcript-file-for-sid (sid &optional _cwd)
-  "Locate the most-recently-modified jsonl transcript for SID.
-Scans every project subdir and picks the freshest file (mtime is
-authoritative since the same sid can appear under multiple cwds).
-The CWD argument is accepted for caller convenience but ignored.
-Backend-specific: only the `jsonl' transcript style is supported;
-other backends return nil so callers fall back to empty results."
-  (when (and sid (eq (claude-dashboard--backend-prop :transcript-style)
-                     'jsonl))
-    (let* ((target (concat sid ".jsonl"))
-           (projects-dir (expand-file-name "projects"
-                                           (claude-dashboard--state-dir)))
-           candidates)
-      (when (file-directory-p projects-dir)
-        (dolist (sub (directory-files projects-dir t "^[^.]"))
-          (let ((c (expand-file-name target sub)))
-            (when (file-readable-p c)
-              (push c candidates))))
-        (when candidates
-          (car (sort candidates
-                     (lambda (a b)
-                       (time-less-p
-                        (file-attribute-modification-time
-                         (file-attributes b))
-                        (file-attribute-modification-time
-                         (file-attributes a)))))))))))
+(defun claude-dashboard--transcript-file-for-sid (sid &optional cwd backend)
+  "Locate the transcript file for SID under the chosen backend.
+BACKEND defaults to the active `claude-dashboard-backend'.
+Dispatches through the backend's `:transcript-path-fn'."
+  (claude-dashboard--backend-call
+   :transcript-path-fn (or backend claude-dashboard-backend) cwd sid))
 
-(defun claude-dashboard--session-name-from-transcript (cwd sid)
-  "Return the latest `customTitle' for SID, or nil when none has been set.
-Walks the transcript bottom-up so the *last* `/name' wins."
-  (claude-dashboard--map-jsonl-entries
-   (claude-dashboard--transcript-file-for-sid sid cwd)
-   (lambda (entry)
-     (when (equal "custom-title" (alist-get 'type entry))
-       (let ((ct (alist-get 'customTitle entry)))
-         (and ct (not (string-empty-p ct)) ct))))
-   t))
+(defun claude-dashboard--session-name-from-transcript (inst &optional sid)
+  "Return the latest `customTitle' for INST's session, or nil.
+Claude-specific: walks the JSONL transcript bottom-up for the most
+recent `custom-title' entry; other backends have no equivalent
+`/name' marker in their transcripts and return nil."
+  (let ((backend (claude-dashboard--instance-backend inst)))
+    (when (eq backend 'claude)
+      (let* ((sid (or sid
+                      (claude-dashboard--live-session-id inst)
+                      (claude-dashboard-instance-session-id inst)))
+             (path (claude-dashboard--inst-transcript-path inst sid)))
+        (claude-dashboard--map-jsonl-entries
+         path
+         (lambda (entry)
+           (when (equal "custom-title" (alist-get 'type entry))
+             (let ((ct (alist-get 'customTitle entry)))
+               (and ct (not (string-empty-p ct)) ct))))
+         t)))))
 
-(defun claude-dashboard--first-prompt-from-transcript (cwd sid)
-  "Return the first human-typed user prompt from SID's transcript, or nil.
-Skips synthetic `<…>' messages and tool results."
-  (claude-dashboard--map-jsonl-entries
-   (claude-dashboard--transcript-file-for-sid sid cwd)
-   (lambda (entry)
-     (when (equal "user" (alist-get 'type entry))
-       (let* ((msg (alist-get 'message entry))
-              (content (and msg (alist-get 'content msg))))
-         (cond
-          ((and (stringp content)
-                (not (string-prefix-p "<" content)))
-           content)
-          ((listp content)
-           (cl-some (lambda (c)
-                      (let ((ctype (alist-get 'type c))
-                            (text (alist-get 'text c)))
-                        (and (equal "text" ctype)
-                             (stringp text)
-                             (not (string-prefix-p "<" text))
-                             text)))
-                    content))))))
-   nil 131072))
+(defun claude-dashboard--first-prompt-from-transcript (inst)
+  "Return the first human-typed user prompt from INST's transcript, or nil.
+Uses INST's backend `:transcript-walk-fn'.  Skips synthetic `<…>'
+messages."
+  (cl-some (lambda (m)
+             (and (eq (alist-get 'role m) 'user)
+                  (let ((txt (alist-get 'text m)))
+                    (and (stringp txt)
+                         (not (string-prefix-p "<" txt))
+                         txt))))
+           (claude-dashboard--inst-walk-messages inst)))
 
 (defun claude-dashboard--live-session-id (inst)
-  "Return the *current* session-id for INST via the running PID, or nil.
+  "Return the *current* session-id for INST via its backend, or nil.
 The struct's `session-id' is captured shortly after launch and can
 go stale when the agent is resumed with a new id under the same
-buffer, so a fresh PID-based lookup is more reliable when the cached
-id has no on-disk transcript."
-  (when-let* ((proc (claude-dashboard--instance-process inst))
-              (pid (and proc (process-id proc)))
-              (json (claude-dashboard--read-session-json pid)))
-    (alist-get 'sessionId json)))
+buffer, so a fresh per-backend lookup is more reliable when the
+cached id has no on-disk transcript."
+  (claude-dashboard--backend-call
+   :session-id-fn (claude-dashboard--instance-backend inst) inst))
 
 (defun claude-dashboard--live-session-name (inst)
   "Return the *current* conversation name for INST, or nil.
-Reads `~/.claude/sessions/<PID>.json' and returns its `name' field.
-This file is updated in real-time by the Claude CLI on `/rename'
-\(and `/name'), so it is the authoritative current value even when
-the per-session transcript jsonl files have older customTitle
-entries from earlier renames."
-  (when-let* ((proc (claude-dashboard--instance-process inst))
-              (pid (and proc (process-id proc)))
-              (json (claude-dashboard--read-session-json pid))
-              (name (alist-get 'name json)))
-    (and (stringp name) (not (string-empty-p name)) name)))
+Dispatches through the backend's `:session-name-fn'.  For Claude
+this reads `~/.claude/sessions/<PID>.json' and returns its `name'
+field, updated in real-time on `/rename'; opencode falls back to
+`session.title' in its SQLite db."
+  (claude-dashboard--backend-call
+   :session-name-fn (claude-dashboard--instance-backend inst) inst))
 
 (defun claude-dashboard--instance-topic (inst)
   "Return INST's session name, or `—' when none has been set.
@@ -1817,16 +1883,28 @@ Claude has actually written the matching `/name' to its metadata."
          (now (float-time)))
     (if (and cur (< (- now (cdr cur)) claude-dashboard-cache-ttl))
         (car cur)
-      (let* ((cwd (claude-dashboard-instance-cwd inst))
-             (live-sid (claude-dashboard--live-session-id inst))
+      (let* ((live-sid (claude-dashboard--live-session-id inst))
              (cached-sid (claude-dashboard-instance-session-id inst))
-             (val (or (claude-dashboard--live-session-name inst)
-                      (claude-dashboard--session-name-from-transcript
-                       cwd live-sid)
-                      (claude-dashboard--session-name-from-transcript
-                       cwd cached-sid)
-                      (gethash buf claude-dashboard--worktree-names)
-                      "—")))
+             (name (or (claude-dashboard--live-session-name inst)
+                       (claude-dashboard--session-name-from-transcript
+                        inst live-sid)
+                       (claude-dashboard--session-name-from-transcript
+                        inst cached-sid)
+                       (gethash buf claude-dashboard--worktree-names)
+                       "—"))
+             ;; Prepend a one-glyph colored backend badge so multi-backend
+             ;; dashboards distinguish claude / opencode / codex rows at
+             ;; a glance.  Width is counted toward TOPIC's column budget.
+             (backend (claude-dashboard--instance-backend inst))
+             (badge-str (or (claude-dashboard--backend-prop :badge backend)
+                            "?"))
+             (badge-color (or (claude-dashboard--backend-prop :badge-color
+                                                             backend)
+                              "gray60"))
+             (badge (propertize badge-str
+                                'face `(:foreground ,badge-color
+                                                    :weight bold)))
+             (val (concat badge " " name)))
         (when (and live-sid (not (equal live-sid cached-sid)))
           (setf (claude-dashboard-instance-session-id inst) live-sid))
         (puthash buf (cons val now) claude-dashboard--topic-cache)
@@ -1963,7 +2041,10 @@ segment intact, elides intermediate components with `…/'."
          (branch (claude-dashboard--instance-deploy-branch inst))
          ;; Collapse any internal newlines / runs of whitespace so the
          ;; row never spans multiple lines even if the source string
-         ;; (e.g. a multi-line first prompt) had a newline.
+         ;; (e.g. a multi-line first prompt) had a newline.  The TOPIC
+         ;; from `--instance-topic' already carries the backend badge
+         ;; prefix (`C '/`O '/`X '), so badge width is included in the
+         ;; column-width fit upstream — no extra accounting needed here.
          (topic (replace-regexp-in-string
                  "[\t\n\r ]+" " "
                  (or (claude-dashboard--instance-topic inst) "")))
@@ -1972,7 +2053,7 @@ segment intact, elides intermediate components with `…/'."
          (sid (or (and sid-full (substring sid-full 0 8)) "—"))
          (activity-cell
           (truncate-string-to-width
-           (claude-dashboard--activity-cell cwd sid-full)
+           (claude-dashboard--activity-cell inst)
            activity-w nil nil "…"))
          ;; Session-kind annotation: if the classifier says this row is
          ;; a monitor session, prepend `↻ ' to the project name (and
@@ -2061,10 +2142,7 @@ the formatted assistant response.  Combined with magit-section's
 `magit-section-show-level-N-all' bindings on `1'..`4', this gives
 three progressive views: rows-only (1), rows + queries (2), rows
 + queries + responses (3)."
-  (let* ((cwd (claude-dashboard-instance-cwd inst))
-         (sid (or (claude-dashboard--live-session-id inst)
-                  (claude-dashboard-instance-session-id inst)))
-         (exchanges (claude-dashboard--all-exchanges cwd sid)))
+  (let* ((exchanges (claude-dashboard--all-exchanges inst)))
     (if exchanges
         (dolist (xch exchanges)
           (claude-dashboard--insert-query-section xch))
@@ -2391,6 +2469,496 @@ display rules apply."
     (with-current-buffer buf
       (claude-dashboard--goto-first-instance))
     (claude-dashboard--fit-window buf)))
+
+;;; --- Backend adapters ----------------------------------------------------
+;;
+;; One block per backend.  Each defines the function-slot implementations
+;; referenced by name in `claude-dashboard-backends'.  Forward references
+;; are fine because the registry stores SYMBOLS that
+;; `claude-dashboard--backend-call' resolves with `fboundp' at dispatch
+;; time, not at registry-build time.
+
+;; ----- Claude ----------------------------------------------------------
+
+(defun claude-dashboard--claude-session-id-fn (inst)
+  "Claude `:session-id-fn' — read sessionId from ~/.claude/sessions/<PID>.json."
+  (when-let* ((proc (claude-dashboard--instance-process inst))
+              (pid (and proc (process-id proc)))
+              (json (claude-dashboard--read-session-json pid)))
+    (alist-get 'sessionId json)))
+
+(defun claude-dashboard--claude-session-name-fn (inst)
+  "Claude `:session-name-fn' — `name' field of the live PID-json file."
+  (when-let* ((proc (claude-dashboard--instance-process inst))
+              (pid (and proc (process-id proc)))
+              (json (claude-dashboard--read-session-json pid))
+              (name (alist-get 'name json)))
+    (and (stringp name) (not (string-empty-p name)) name)))
+
+(defun claude-dashboard--claude-transcript-path-fn (_cwd sid)
+  "Claude `:transcript-path-fn' — newest projects/<slug>/<SID>.jsonl."
+  (when sid
+    (let* ((target (concat sid ".jsonl"))
+           (projects-dir (expand-file-name
+                          "projects"
+                          (or claude-dashboard-claude-dir
+                              (claude-dashboard--backend-prop
+                               :state-dir 'claude))))
+           candidates)
+      (when (file-directory-p projects-dir)
+        (dolist (sub (directory-files projects-dir t "^[^.]"))
+          (let ((c (expand-file-name target sub)))
+            (when (file-readable-p c)
+              (push c candidates))))
+        (when candidates
+          (car (sort candidates
+                     (lambda (a b)
+                       (time-less-p
+                        (file-attribute-modification-time
+                         (file-attributes b))
+                        (file-attribute-modification-time
+                         (file-attributes a)))))))))))
+
+(defun claude-dashboard--claude-transcript-walk-fn (path)
+  "Claude `:transcript-walk-fn' — JSONL → normalized message list.
+Each user/assistant entry is normalized to `((role . SYM)
+\(text . STR) (ts . FLOAT) (raw . ENTRY))'.  Synthetic `<…>'
+messages and tool-result-only user turns are filtered out."
+  (let (msgs)
+    (claude-dashboard--map-jsonl-entries
+     path
+     (lambda (entry)
+       (let* ((type (alist-get 'type entry))
+              (msg (alist-get 'message entry))
+              (is-meta (alist-get 'isMeta entry))
+              (role (cond ((equal type "user") 'user)
+                          ((equal type "assistant") 'assistant)))
+              (ts-str (alist-get 'timestamp entry))
+              (ts (and ts-str (ignore-errors
+                                (float-time (date-to-time ts-str)))))
+              (content (and msg (alist-get 'content msg))))
+         (when (and role (not is-meta))
+           (let ((text (cond
+                        ((stringp content) content)
+                        ((listp content)
+                         (when-let ((tb (cl-find-if
+                                         (lambda (c)
+                                           (equal "text" (alist-get 'type c)))
+                                         content)))
+                           (alist-get 'text tb))))))
+             (when (and text (stringp text)
+                        (not (string-prefix-p "<" text))
+                        (> (length (string-trim text)) 0))
+               (push `((role . ,role)
+                       (text . ,(string-trim text))
+                       (ts   . ,ts)
+                       (raw  . ,entry))
+                     msgs)))))
+       nil))
+    (nreverse msgs)))
+
+(defun claude-dashboard--claude-list-sessions-fn ()
+  "Claude `:list-sessions-fn' — scan ~/.claude/projects/ for past sessions."
+  (let* ((root (expand-file-name
+                "projects"
+                (or claude-dashboard-claude-dir
+                    (claude-dashboard--backend-prop :state-dir 'claude))))
+         (acc '()))
+    (when (file-directory-p root)
+      (dolist (proj-dir (directory-files root t "^[^.]" t))
+        (when (file-directory-p proj-dir)
+          (dolist (jsonl (directory-files proj-dir t "\\.jsonl\\'" t))
+            (let* ((bn (file-name-nondirectory jsonl))
+                   (sid (file-name-sans-extension bn))
+                   (mtime (file-attribute-modification-time
+                           (file-attributes jsonl)))
+                   (info (claude-dashboard--read-jsonl-cwd-and-prompt jsonl))
+                   (cwd (car info))
+                   (prompt (cdr info)))
+              (when cwd
+                (push (make-claude-dashboard-past-session
+                       :session-id sid
+                       :cwd cwd
+                       :mtime mtime
+                       :first-prompt prompt
+                       :jsonl-path jsonl)
+                      acc)))))))
+    (sort acc (lambda (a b)
+                (time-less-p (claude-dashboard-past-session-mtime b)
+                             (claude-dashboard-past-session-mtime a))))))
+
+(defun claude-dashboard--claude-rename-fn (proc slug)
+  "Claude `:rename-fn' — inject `/name SLUG\\n' into PROC's PTY."
+  (when (and proc (process-live-p proc) slug (not (string-empty-p slug)))
+    (process-send-string proc (format "/name %s\n" slug))
+    t))
+
+;; ----- Opencode --------------------------------------------------------
+;;
+;; Opencode persists every session and message in a single SQLite
+;; database at <state-dir>/opencode-stable.db (WAL mode).  We read
+;; through Emacs 30's built-in sqlite-* primitives; older Emacs / Emacs
+;; built without sqlite get a graceful nil-stub.  Schema (simplified):
+;;
+;;   session(id, directory, title, time_updated, time_archived, ...)
+;;   message(id, session_id, data, ...)        -- `data' is a JSON blob
+;;                                                whose `role' field is
+;;                                                the message role.
+;;   part(id, message_id, time_created, data)  -- `data' is a JSON blob
+;;                                                whose `type' = "text"
+;;                                                content carries the
+;;                                                actual prose.
+
+(defcustom claude-dashboard-opencode-db-name "opencode-stable.db"
+  "Filename (under the opencode state dir) of the sessions database."
+  :type 'string :group 'claude-dashboard)
+
+(defvar claude-dashboard--opencode-unavailable-warned nil
+  "Non-nil once we've emitted the one-shot `sqlite unavailable' message.")
+
+(defun claude-dashboard--opencode-warn-unavailable ()
+  "Emit a one-shot message that opencode columns will be blank.
+Triggered when `sqlite-available-p' returns nil — typically an
+Emacs build without --with-sqlite3.  Stays silent on subsequent
+calls so the message line isn't spammed every refresh."
+  (unless claude-dashboard--opencode-unavailable-warned
+    (setq claude-dashboard--opencode-unavailable-warned t)
+    (message "claude-dashboard: opencode adapter needs Emacs built with sqlite3 support — transcript columns will be blank")))
+
+(defun claude-dashboard--opencode-db-path ()
+  "Return the absolute path to opencode's sessions db."
+  (expand-file-name claude-dashboard-opencode-db-name
+                    (or claude-dashboard-claude-dir
+                        (claude-dashboard--backend-prop
+                         :state-dir 'opencode))))
+
+(defmacro claude-dashboard--with-opencode-db (var &rest body)
+  "Open opencode's SQLite db bound to VAR, run BODY, then close.
+Evaluates to BODY's value, or nil when sqlite is unavailable / db
+is missing.  Errors during BODY are swallowed (best-effort reads)."
+  (declare (indent 1) (debug t))
+  `(if (not (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+       (progn (claude-dashboard--opencode-warn-unavailable) nil)
+     (let* ((path (claude-dashboard--opencode-db-path)))
+       (when (file-readable-p path)
+         (let ((,var nil) result)
+           (unwind-protect
+               (progn
+                 (setq ,var (sqlite-open path))
+                 (setq result (ignore-errors ,@body)))
+             (when ,var (ignore-errors (sqlite-close ,var))))
+           result)))))
+
+(defun claude-dashboard--opencode-row-session (row)
+  "Pack a `session' row into a `claude-dashboard-past-session'."
+  (let* ((id (nth 0 row))
+         (dir (nth 1 row))
+         (title (nth 2 row))
+         (updated (nth 3 row))
+         (mtime (when (numberp updated)
+                  ;; opencode stores time in ms since epoch.
+                  (seconds-to-time (/ updated 1000.0)))))
+    (make-claude-dashboard-past-session
+     :session-id id
+     :cwd (and dir (file-name-as-directory dir))
+     :mtime (or mtime (current-time))
+     :first-prompt title
+     :jsonl-path nil)))
+
+(defun claude-dashboard--opencode-session-id-fn (inst)
+  "Opencode `:session-id-fn' — newest session whose directory = INST cwd."
+  (let* ((cwd (directory-file-name
+               (claude-dashboard-instance-cwd inst))))
+    (claude-dashboard--with-opencode-db db
+      (let ((rows (sqlite-select
+                   db
+                   "SELECT id FROM session \
+                    WHERE directory = ? AND time_archived IS NULL \
+                    ORDER BY time_updated DESC LIMIT 1"
+                   (list cwd))))
+        (caar rows)))))
+
+(defun claude-dashboard--opencode-session-name-fn (inst)
+  "Opencode `:session-name-fn' — `title' of the live session row."
+  (let* ((sid (or (claude-dashboard-instance-session-id inst)
+                  (claude-dashboard--opencode-session-id-fn inst))))
+    (when sid
+      (claude-dashboard--with-opencode-db db
+        (let ((rows (sqlite-select
+                     db
+                     "SELECT title FROM session WHERE id = ? LIMIT 1"
+                     (list sid))))
+          (let ((title (caar rows)))
+            (and (stringp title) (not (string-empty-p title)) title)))))))
+
+(defun claude-dashboard--opencode-transcript-path-fn (_cwd sid)
+  "Opencode `:transcript-path-fn' — encode SID into a synthetic db: URI.
+The opencode walker takes this string and re-derives the db path
+\(everything is in a single SQLite file), so we use the slot purely
+as a way to keep the dispatch chain identical to the JSONL backends."
+  (when sid
+    (concat "opencode-db:" sid)))
+
+(defun claude-dashboard--opencode-transcript-walk-fn (path)
+  "Opencode `:transcript-walk-fn' — query SQLite for normalized msgs.
+PATH is the `opencode-db:<sid>' synthetic URI minted by
+`--opencode-transcript-path-fn'."
+  (when (and (stringp path) (string-prefix-p "opencode-db:" path))
+    (let* ((sid (substring path (length "opencode-db:")))
+           msgs)
+      (claude-dashboard--with-opencode-db db
+        (let ((rows (sqlite-select
+                     db
+                     "SELECT m.data, p.data, p.time_created \
+                      FROM part p JOIN message m ON p.message_id = m.id \
+                      WHERE m.session_id = ? \
+                      ORDER BY p.time_created ASC"
+                     (list sid))))
+          (dolist (r rows)
+            (let* ((mdata (ignore-errors
+                            (json-parse-string
+                             (nth 0 r)
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil :false-object nil)))
+                   (pdata (ignore-errors
+                            (json-parse-string
+                             (nth 1 r)
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil :false-object nil)))
+                   (role-str (and mdata (alist-get 'role mdata)))
+                   (role (pcase role-str
+                           ("user" 'user)
+                           ("assistant" 'assistant)
+                           (_ nil)))
+                   (ptype (and pdata (alist-get 'type pdata)))
+                   (text (and pdata (alist-get 'text pdata)))
+                   (ts-ms (nth 2 r))
+                   (ts (when (numberp ts-ms) (/ ts-ms 1000.0))))
+              (when (and role (equal ptype "text")
+                         (stringp text)
+                         (> (length (string-trim text)) 0))
+                (push `((role . ,role)
+                        (text . ,(string-trim text))
+                        (ts   . ,ts)
+                        (raw  . ((message . ,mdata) (part . ,pdata))))
+                      msgs))))))
+      (nreverse msgs))))
+
+(defun claude-dashboard--opencode-list-sessions-fn ()
+  "Opencode `:list-sessions-fn' — non-archived sessions, newest first."
+  (or (claude-dashboard--with-opencode-db db
+        (let ((rows (sqlite-select
+                     db
+                     "SELECT id, directory, title, time_updated \
+                      FROM session \
+                      WHERE time_archived IS NULL \
+                      ORDER BY time_updated DESC")))
+          (mapcar #'claude-dashboard--opencode-row-session rows)))
+      '()))
+
+;; ----- Codex -----------------------------------------------------------
+;;
+;; Codex writes one JSONL per session to
+;;   ~/.codex/sessions/YYYY/MM/DD/rollout-<TS>-<UUID>.jsonl
+;; The first line is a meta record carrying session_id, cwd, model,
+;; and a timestamp.  Subsequent lines are RolloutLine entries; the
+;; ones we care about are ResponseItem rows with role user/assistant
+;; and a content[0].text field.
+
+(defun claude-dashboard--codex-state-dir ()
+  "Resolve codex's state directory."
+  (or claude-dashboard-claude-dir
+      (claude-dashboard--backend-prop :state-dir 'codex)))
+
+(defun claude-dashboard--codex-rollout-files (&optional max-depth-days)
+  "Return rollout JSONL paths under codex's sessions dir, newest first.
+MAX-DEPTH-DAYS, when non-nil, restricts the scan to the most
+recent N day-directories (cheaper than a full walk; live discovery
+only needs today + yesterday)."
+  (let* ((sessions (expand-file-name "sessions"
+                                     (claude-dashboard--codex-state-dir)))
+         files)
+    (when (file-directory-p sessions)
+      (let ((day-dirs '()))
+        ;; YYYY/MM/DD layout.
+        (dolist (y (directory-files sessions t "^[0-9]"))
+          (when (file-directory-p y)
+            (dolist (m (directory-files y t "^[0-9]"))
+              (when (file-directory-p m)
+                (dolist (d (directory-files m t "^[0-9]"))
+                  (when (file-directory-p d)
+                    (push d day-dirs)))))))
+        (setq day-dirs
+              (sort day-dirs
+                    (lambda (a b)
+                      (time-less-p
+                       (file-attribute-modification-time
+                        (file-attributes b))
+                       (file-attribute-modification-time
+                        (file-attributes a))))))
+        (when max-depth-days
+          (setq day-dirs (seq-take day-dirs max-depth-days)))
+        (dolist (d day-dirs)
+          (dolist (f (directory-files d t "^rollout-.*\\.jsonl\\'"))
+            (push f files)))))
+    (sort files
+          (lambda (a b)
+            (time-less-p (file-attribute-modification-time
+                          (file-attributes b))
+                         (file-attribute-modification-time
+                          (file-attributes a)))))))
+
+(defun claude-dashboard--codex-read-header (path)
+  "Return the parsed meta-record (alist) from the head of rollout PATH."
+  (when (file-readable-p path)
+    (with-temp-buffer
+      (insert-file-contents path nil 0 8192)
+      (goto-char (point-min))
+      (ignore-errors
+        (json-parse-buffer :object-type 'alist
+                           :array-type 'list
+                           :null-object nil
+                           :false-object nil)))))
+
+(defun claude-dashboard--codex-header-meta (header)
+  "Return the `payload' / meta sub-alist from a rollout HEADER record.
+Codex's header schema has evolved: older rollouts carry `meta'
+directly at top-level, newer ones nest it under `payload'."
+  (or (alist-get 'payload header)
+      (alist-get 'meta header)
+      header))
+
+(defun claude-dashboard--codex-session-id-fn (inst)
+  "Codex `:session-id-fn' — newest rollout whose meta.cwd = INST cwd."
+  (let* ((target (directory-file-name
+                  (claude-dashboard-instance-cwd inst)))
+         (started (or (claude-dashboard-instance-started-at inst) 0)))
+    (cl-some
+     (lambda (path)
+       (let* ((mtime (float-time
+                      (file-attribute-modification-time
+                       (file-attributes path))))
+              (header (claude-dashboard--codex-read-header path))
+              (meta (claude-dashboard--codex-header-meta header))
+              (cwd (and meta (alist-get 'cwd meta)))
+              (sid (and meta (or (alist-get 'session_id meta)
+                                 (alist-get 'id meta)))))
+         (when (and cwd sid
+                    (>= mtime (- started 5.0))
+                    (equal (directory-file-name cwd) target))
+           sid)))
+     ;; Today + yesterday is enough for live discovery.
+     (claude-dashboard--codex-rollout-files 2))))
+
+(defun claude-dashboard--codex-session-name-fn (_inst)
+  "Codex `:session-name-fn' — codex has no live rename file yet."
+  nil)
+
+(defun claude-dashboard--codex-transcript-path-fn (_cwd sid)
+  "Codex `:transcript-path-fn' — find the rollout JSONL for SID."
+  (when sid
+    (cl-some
+     (lambda (path)
+       (let* ((header (claude-dashboard--codex-read-header path))
+              (meta (claude-dashboard--codex-header-meta header))
+              (this-sid (and meta (or (alist-get 'session_id meta)
+                                      (alist-get 'id meta)))))
+         (and (equal this-sid sid) path)))
+     (claude-dashboard--codex-rollout-files))))
+
+(defun claude-dashboard--codex-transcript-walk-fn (path)
+  "Codex `:transcript-walk-fn' — walk rollout JSONL, normalize messages.
+Skips the header record; only ResponseItem rows with role
+user/assistant and a content[0].text field are emitted."
+  (let (msgs)
+    (with-temp-buffer
+      (when (file-readable-p path)
+        (insert-file-contents path)
+        (goto-char (point-min))
+        ;; Skip header.
+        (forward-line 1)
+        (while (not (eobp))
+          (when (looking-at "{")
+            (let* ((entry (ignore-errors
+                            (json-parse-buffer
+                             :object-type 'alist
+                             :array-type 'list
+                             :null-object nil
+                             :false-object nil))))
+              (goto-char (line-beginning-position))
+              (when entry
+                (let* ((type (alist-get 'type entry))
+                       (payload (or (alist-get 'payload entry) entry))
+                       (item-type (alist-get 'type payload))
+                       (role-str (alist-get 'role payload))
+                       (role (pcase role-str
+                               ("user" 'user)
+                               ("assistant" 'assistant)
+                               (_ nil)))
+                       (content (alist-get 'content payload))
+                       (text (cond
+                              ((stringp content) content)
+                              ((listp content)
+                               (when-let ((tb (cl-find-if
+                                               (lambda (c)
+                                                 (and (listp c)
+                                                      (or (equal "input_text"
+                                                                 (alist-get 'type c))
+                                                          (equal "output_text"
+                                                                 (alist-get 'type c))
+                                                          (equal "text"
+                                                                 (alist-get 'type c)))))
+                                               content)))
+                                 (alist-get 'text tb)))))
+                       (ts-str (alist-get 'timestamp entry))
+                       (ts (and ts-str (ignore-errors
+                                         (float-time (date-to-time ts-str))))))
+                  (when (and role
+                             (or (equal item-type "message")
+                                 (equal type "response_item"))
+                             (stringp text)
+                             (> (length (string-trim text)) 0))
+                    (push `((role . ,role)
+                            (text . ,(string-trim text))
+                            (ts   . ,ts)
+                            (raw  . ,entry))
+                          msgs))))))
+          (forward-line 1))))
+    (nreverse msgs)))
+
+(defun claude-dashboard--codex-list-sessions-fn ()
+  "Codex `:list-sessions-fn' — every rollout file, header parsed."
+  (let (acc)
+    (dolist (path (claude-dashboard--codex-rollout-files))
+      (let* ((header (claude-dashboard--codex-read-header path))
+             (meta (claude-dashboard--codex-header-meta header))
+             (sid (and meta (or (alist-get 'session_id meta)
+                                (alist-get 'id meta))))
+             (cwd (and meta (alist-get 'cwd meta)))
+             (mtime (file-attribute-modification-time
+                     (file-attributes path))))
+        (when (and sid cwd)
+          (push (make-claude-dashboard-past-session
+                 :session-id sid
+                 :cwd (file-name-as-directory cwd)
+                 :mtime mtime
+                 :first-prompt nil
+                 :jsonl-path path)
+                acc))))
+    (nreverse acc)))
+
+(defun claude-dashboard--codex-rename-fn (proc slug)
+  "Codex `:rename-fn' — `/rename SLUG' via the split-write rule.
+TUI input lines occasionally drop their CR if the body + newline
+arrive in the same write; sending the body, sitting for 50ms, and
+then writing a lone `\\r' reliably lands the command."
+  (when (and proc (process-live-p proc) slug (not (string-empty-p slug)))
+    (process-send-string proc (format "/rename %s" slug))
+    (sit-for 0.05)
+    (process-send-string proc "\r")
+    t))
 
 (provide 'claude-dashboard)
 ;;; claude-dashboard.el ends here
