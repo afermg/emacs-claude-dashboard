@@ -1,17 +1,17 @@
-;;; claude-dashboard-usage.el --- Monitor Claude usage limits + auto-resume -*- lexical-binding: t; -*-
+;;; llm-dashboard-usage.el --- Monitor Claude usage limits + auto-resume -*- lexical-binding: t; -*-
 
 ;; Author: Alán F. Muñoz
 ;; Keywords: tools, convenience
-;; Package-Requires: ((emacs "28.1") (claude-dashboard "0.1") (claude-dashboard-schedule "0.1"))
+;; Package-Requires: ((emacs "28.1") (llm-dashboard "0.2") (llm-dashboard-schedule "0.1"))
 
 ;;; Commentary:
 ;;
 ;; Scans each live claude instance's eat buffer for the TUI's
 ;; usage-limit warnings (5-hour session, weekly, Opus, Sonnet, overage)
-;; and reacts according to `claude-dashboard-usage-mode':
+;; and reacts according to `llm-dashboard-usage-mode':
 ;;
 ;;   :monitor      (default) — populate a per-instance usage cache;
-;;                 expose via `M-x claude-dashboard-usage-list'.  No
+;;                 expose via `M-x llm-dashboard-usage-list'.  No
 ;;                 actions taken.
 ;;
 ;;   :notify       — additionally fire `notifications-notify' on every
@@ -19,10 +19,10 @@
 ;;
 ;;   :auto-resume  — additionally, on first detection of a
 ;;                 `Approaching' warning with a parseable reset time,
-;;                 auto-enqueue a `claude-dashboard-schedule-send'
-;;                 with `claude-dashboard-usage-resume-message'
+;;                 auto-enqueue a `llm-dashboard-schedule-send'
+;;                 with `llm-dashboard-usage-resume-message'
 ;;                 (default "continue") at
-;;                 (reset-time + claude-dashboard-usage-resume-buffer-seconds).
+;;                 (reset-time + llm-dashboard-usage-resume-buffer-seconds).
 ;;                 Idempotent per (sid, reset-time) pair.
 ;;
 ;; Detection is buffer-scan based: claude does NOT log limit events to
@@ -33,25 +33,25 @@
 ;; need updating.
 ;;
 ;; Entry points:
-;;   M-x claude-dashboard-usage-list      — current usage state, all instances
-;;   M-x claude-dashboard-usage-now       — force a one-shot scan
+;;   M-x llm-dashboard-usage-list      — current usage state, all instances
+;;   M-x llm-dashboard-usage-now       — force a one-shot scan
 ;;
 ;; Configuration entry points:
-;;   `claude-dashboard-usage-mode'
-;;   `claude-dashboard-usage-resume-message'
-;;   `claude-dashboard-usage-resume-buffer-seconds'
-;;   `claude-dashboard-usage-patterns'
+;;   `llm-dashboard-usage-mode'
+;;   `llm-dashboard-usage-resume-message'
+;;   `llm-dashboard-usage-resume-buffer-seconds'
+;;   `llm-dashboard-usage-patterns'
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'claude-dashboard)
-(require 'claude-dashboard-schedule)
+(require 'llm-dashboard)
+(require 'llm-dashboard-schedule)
 (require 'tabulated-list)
 
 ;;; --- Customs ---------------------------------------------------------------
 
-(defcustom claude-dashboard-usage-mode :monitor
+(defcustom llm-dashboard-usage-mode :monitor
   "Reaction policy when a usage limit is detected.
 
   :monitor      — track state, expose via the list command.  Default.
@@ -63,35 +63,35 @@
   :type '(choice (const :tag "Track only" :monitor)
                  (const :tag "Track + notify" :notify)
                  (const :tag "Track + notify + auto-resume" :auto-resume))
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-scan-interval 5
+(defcustom llm-dashboard-usage-scan-interval 5
   "Seconds between background scans of live instances for limit text."
   :type 'number
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-tail-chars 4000
+(defcustom llm-dashboard-usage-tail-chars 4000
   "Characters from each instance's buffer tail to scan for limit text.
 4000 covers the warning + a few rows of conversation; bump if claude
 buffers a lot of output between the warning and the prompt."
   :type 'integer
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-resume-message "continue"
-  "Message body sent at reset time when `claude-dashboard-usage-mode'
+(defcustom llm-dashboard-usage-resume-message "continue"
+  "Message body sent at reset time when `llm-dashboard-usage-mode'
 is `:auto-resume'."
   :type 'string
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-resume-buffer-seconds 90
+(defcustom llm-dashboard-usage-resume-buffer-seconds 90
   "Seconds added to the parsed reset time before firing the resume.
 A small buffer avoids racing the limit window — claude's reset is
 rounded to the minute, so firing at the exact reset can occasionally
 get caught by the same limit."
   :type 'integer
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-kind-labels
+(defcustom llm-dashboard-usage-kind-labels
   '(("session limit"        . session)
     ("weekly limit"         . weekly)
     ("usage limit"          . usage)
@@ -104,9 +104,9 @@ bundled binary's SE1 map).  If claude introduces a new label, add it
 here so the scanner classifies it instead of falling through to
 `other'."
   :type '(alist :key-type string :value-type symbol)
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
-(defcustom claude-dashboard-usage-patterns
+(defcustom llm-dashboard-usage-patterns
   '(;; Approaching warning (with reset time).
     (approaching
      .
@@ -139,11 +139,11 @@ The middle-dot character is U+00B7 — claude renders it literally in
 the TUI between segments.  The patterns also accept the ASCII bullet
 `*' as a fallback for terminals that down-translate the codepoint."
   :type '(alist :key-type symbol :value-type regexp)
-  :group 'claude-dashboard)
+  :group 'llm-dashboard)
 
 ;;; --- Data ------------------------------------------------------------------
 
-(cl-defstruct claude-dashboard-usage
+(cl-defstruct llm-dashboard-usage
   ;; STATE: nil | 'approaching | 'utilization | 'reached
   state
   ;; KIND: 'session | 'weekly | 'usage | 'overage | 'opus | 'sonnet | 'other
@@ -159,16 +159,16 @@ the TUI between segments.  The patterns also accept the ASCII bullet
   ;; DETECTED-AT: encoded-time when this row was first observed
   detected-at)
 
-(defvar claude-dashboard--usage-cache (make-hash-table :test 'eq)
-  "Map: instance buffer -> latest claude-dashboard-usage struct (or nil).")
+(defvar llm-dashboard--usage-cache (make-hash-table :test 'eq)
+  "Map: instance buffer -> latest llm-dashboard-usage struct (or nil).")
 
-(defvar claude-dashboard--usage-actioned (make-hash-table :test 'equal)
+(defvar llm-dashboard--usage-actioned (make-hash-table :test 'equal)
   "Set: keys (sid . reset-text) we've already auto-actioned.
 Prevents the 5-second scanner from re-enqueuing the same resume on
 every tick while the warning text remains in the buffer.")
 
-(defvar claude-dashboard--usage-timer nil
-  "Background timer running `claude-dashboard-usage--refresh-all'.")
+(defvar llm-dashboard--usage-timer nil
+  "Background timer running `llm-dashboard-usage--refresh-all'.")
 
 ;;; --- Reset-time parser -----------------------------------------------------
 ;;
@@ -177,7 +177,7 @@ every tick while the warning text remains in the buffer.")
 ;; match wins.  Anything that doesn't parse leaves `reset-time' as nil
 ;; and the user can still see the raw text via the list command.
 
-(defun claude-dashboard-usage--parse-when (text)
+(defun llm-dashboard-usage--parse-when (text)
   "Parse TEXT (claude's reset-time string) into encoded-time or nil."
   (when (stringp text)
     (let ((s (string-trim text))
@@ -196,7 +196,7 @@ every tick while the warning text remains in the buffer.")
               "\\`tomorrow[[:space:]]+at[[:space:]]+\
 \\([0-9]\\{1,2\\}\\)\\(?::\\([0-9]\\{2\\}\\)\\)?[[:space:]]*\
 \\(am\\|pm\\|AM\\|PM\\)?\\'" s)
-         (claude-dashboard-usage--at-clock-time
+         (llm-dashboard-usage--at-clock-time
           (string-to-number (match-string 1 s))
           (string-to-number (or (match-string 2 s) "0"))
           (match-string 3 s)
@@ -205,19 +205,19 @@ every tick while the warning text remains in the buffer.")
        (when (string-match
               "\\`\\([0-9]\\{1,2\\}\\)\\(?::\\([0-9]\\{2\\}\\)\\)?\
 [[:space:]]*\\(am\\|pm\\|AM\\|PM\\)\\'" s)
-         (claude-dashboard-usage--at-clock-time
+         (llm-dashboard-usage--at-clock-time
           (string-to-number (match-string 1 s))
           (string-to-number (or (match-string 2 s) "0"))
           (match-string 3 s)
           0))
        ;; 24-hour "HH:MM"
        (when (string-match "\\`\\([0-9]\\{1,2\\}\\):\\([0-9]\\{2\\}\\)\\'" s)
-         (claude-dashboard-usage--at-clock-time
+         (llm-dashboard-usage--at-clock-time
           (string-to-number (match-string 1 s))
           (string-to-number (match-string 2 s))
           nil 0))))))
 
-(defun claude-dashboard-usage--at-clock-time (h m am-pm day-offset)
+(defun llm-dashboard-usage--at-clock-time (h m am-pm day-offset)
   "Build encoded-time at H:M today + DAY-OFFSET days.
 AM-PM is `am'/`pm' (or nil for 24h).  When AM-PM is present, H is in
 12-hour form.  If the resulting time is in the past *and DAY-OFFSET
@@ -242,19 +242,19 @@ is 0*, roll forward 24h."
 
 ;;; --- Scanner ---------------------------------------------------------------
 
-(defun claude-dashboard-usage--label->kind (label)
+(defun llm-dashboard-usage--label->kind (label)
   "Map a TUI label string to an internal symbol via
-`claude-dashboard-usage-kind-labels'.  Falls back to `other'."
-  (or (cdr (assoc-string label claude-dashboard-usage-kind-labels)) 'other))
+`llm-dashboard-usage-kind-labels'.  Falls back to `other'."
+  (or (cdr (assoc-string label llm-dashboard-usage-kind-labels)) 'other))
 
-(defun claude-dashboard-usage--scan-buffer (buf)
-  "Scan BUF's tail for limit text. Return claude-dashboard-usage or nil."
+(defun llm-dashboard-usage--scan-buffer (buf)
+  "Scan BUF's tail for limit text. Return llm-dashboard-usage or nil."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (save-excursion
         (let* ((tail-start (max (point-min)
                                 (- (point-max)
-                                   claude-dashboard-usage-tail-chars)))
+                                   llm-dashboard-usage-tail-chars)))
                (tail (buffer-substring-no-properties tail-start (point-max)))
                result)
           ;; Test patterns in priority order: reached > approaching >
@@ -263,9 +263,9 @@ is 0*, roll forward 24h."
           (cl-block scan
             ;; Reached (rejected) — priority 1.
             (when (string-match (alist-get 'reached
-                                            claude-dashboard-usage-patterns)
+                                            llm-dashboard-usage-patterns)
                                 tail)
-              (setq result (make-claude-dashboard-usage
+              (setq result (make-llm-dashboard-usage
                             :state 'reached
                             :kind 'unknown
                             :kind-label "usage limit reached"
@@ -273,84 +273,84 @@ is 0*, roll forward 24h."
               (cl-return-from scan))
             ;; Approaching — priority 2.
             (when (string-match (alist-get 'approaching
-                                            claude-dashboard-usage-patterns)
+                                            llm-dashboard-usage-patterns)
                                 tail)
               (let* ((label (string-trim (match-string 1 tail)))
                      (when-text (string-trim (match-string 2 tail))))
-                (setq result (make-claude-dashboard-usage
+                (setq result (make-llm-dashboard-usage
                               :state 'approaching
-                              :kind (claude-dashboard-usage--label->kind label)
+                              :kind (llm-dashboard-usage--label->kind label)
                               :kind-label label
                               :when-text when-text
                               :reset-time
-                              (claude-dashboard-usage--parse-when when-text)
+                              (llm-dashboard-usage--parse-when when-text)
                               :detected-at (current-time))))
               (cl-return-from scan))
             ;; Utilization — priority 3.
             (when (string-match (alist-get 'utilization
-                                            claude-dashboard-usage-patterns)
+                                            llm-dashboard-usage-patterns)
                                 tail)
               (let* ((pct (string-to-number (match-string 1 tail)))
                      (label (string-trim (match-string 2 tail)))
                      (when-text (and (match-string 3 tail)
                                      (string-trim (match-string 3 tail)))))
-                (setq result (make-claude-dashboard-usage
+                (setq result (make-llm-dashboard-usage
                               :state 'utilization
-                              :kind (claude-dashboard-usage--label->kind label)
+                              :kind (llm-dashboard-usage--label->kind label)
                               :kind-label label
                               :pct pct
                               :when-text when-text
                               :reset-time (and when-text
-                                               (claude-dashboard-usage--parse-when
+                                               (llm-dashboard-usage--parse-when
                                                 when-text))
                               :detected-at (current-time))))))
           result)))))
 
-(defun claude-dashboard-usage--refresh-all ()
+(defun llm-dashboard-usage--refresh-all ()
   "Scan every live instance, update the cache, fire mode-dependent reactions."
-  (dolist (inst (claude-dashboard--instances-list))
-    (let* ((buf (claude-dashboard-instance-buffer inst))
-           (before (gethash buf claude-dashboard--usage-cache))
-           (after (claude-dashboard-usage--scan-buffer buf)))
-      (puthash buf after claude-dashboard--usage-cache)
+  (dolist (inst (llm-dashboard--instances-list))
+    (let* ((buf (llm-dashboard-instance-buffer inst))
+           (before (gethash buf llm-dashboard--usage-cache))
+           (after (llm-dashboard-usage--scan-buffer buf)))
+      (puthash buf after llm-dashboard--usage-cache)
       ;; Only react on transitions, not on every tick while the warning
       ;; sits in the buffer.  A "transition" is: state changed, OR the
       ;; reset-time changed (a fresh window after a previous reset).
       (when (and after
-                 (not (equal (and before (claude-dashboard-usage-state before))
-                             (claude-dashboard-usage-state after)))
+                 (not (equal (and before (llm-dashboard-usage-state before))
+                             (llm-dashboard-usage-state after)))
                  (not (equal (and before
-                                  (claude-dashboard-usage-when-text before))
-                             (claude-dashboard-usage-when-text after))))
-        (claude-dashboard-usage--on-transition inst after)))))
+                                  (llm-dashboard-usage-when-text before))
+                             (llm-dashboard-usage-when-text after))))
+        (llm-dashboard-usage--on-transition inst after)))))
 
 ;;;###autoload
-(defun claude-dashboard-usage-now ()
+(defun llm-dashboard-usage-now ()
   "Force a one-shot usage scan across all live instances."
   (interactive)
-  (claude-dashboard-usage--refresh-all)
+  (llm-dashboard-usage--refresh-all)
   (let ((hits (cl-count-if #'identity
                            (hash-table-values
-                            claude-dashboard--usage-cache))))
-    (message "claude-dashboard usage: scanned %d instance(s), %d with active limit text"
-             (hash-table-count claude-dashboard--usage-cache)
+                            llm-dashboard--usage-cache))))
+    (message "llm-dashboard usage: scanned %d instance(s), %d with active limit text"
+             (hash-table-count llm-dashboard--usage-cache)
              hits)))
 
 ;;; --- Reactions per mode ----------------------------------------------------
 
-(defun claude-dashboard-usage--on-transition (inst usage)
+(defun llm-dashboard-usage--on-transition (inst usage)
   "Mode-dependent reaction when INST transitions to USAGE state."
-  (let* ((buf (claude-dashboard-instance-buffer inst))
-         (sid (or (and (fboundp 'claude-dashboard--live-session-id)
-                       (claude-dashboard--live-session-id inst))
-                  (claude-dashboard-instance-session-id inst)))
-         (state (claude-dashboard-usage-state usage))
-         (label (or (claude-dashboard-usage-kind-label usage) "limit"))
-         (when-text (claude-dashboard-usage-when-text usage))
-         (reset-time (claude-dashboard-usage-reset-time usage))
-         (mode claude-dashboard-usage-mode))
+  (let* ((buf (llm-dashboard-instance-buffer inst))
+         (sid (or (and (fboundp 'llm-dashboard--live-session-id)
+                       (llm-dashboard--live-session-id inst))
+                  (llm-dashboard-instance-session-id inst)))
+         (state (llm-dashboard-usage-state usage))
+         (label (or (llm-dashboard-usage-kind-label usage) "limit"))
+         (when-text (llm-dashboard-usage-when-text usage))
+         (reset-time (llm-dashboard-usage-reset-time usage))
+         (mode llm-dashboard-usage-mode))
     ;; Always emit a brief modeline message in monitor mode.
-    (message "claude-dashboard usage: %s — %s%s"
+    (message "llm-dashboard usage: %s — %s%s"
              (buffer-name buf)
              (pcase state
                ('approaching (format "approaching %s%s" label
@@ -358,7 +358,7 @@ is 0*, roll forward 24h."
                                          (format " (resets %s)" when-text)
                                        "")))
                ('utilization (format "%s%% of %s%s"
-                                     (claude-dashboard-usage-pct usage)
+                                     (llm-dashboard-usage-pct usage)
                                      label
                                      (if when-text
                                          (format ", resets %s" when-text)
@@ -385,35 +385,35 @@ is 0*, roll forward 24h."
                sid
                reset-time)
       (let ((key (cons sid when-text)))
-        (unless (gethash key claude-dashboard--usage-actioned)
-          (puthash key t claude-dashboard--usage-actioned)
+        (unless (gethash key llm-dashboard--usage-actioned)
+          (puthash key t llm-dashboard--usage-actioned)
           (let* ((fire-time
                   (time-add reset-time
                             (seconds-to-time
-                             claude-dashboard-usage-resume-buffer-seconds))))
-            (claude-dashboard-schedule-send
+                             llm-dashboard-usage-resume-buffer-seconds))))
+            (llm-dashboard-schedule-send
              inst
-             claude-dashboard-usage-resume-message
+             llm-dashboard-usage-resume-message
              (format-time-string "%Y-%m-%d %H:%M" fire-time))
             (message
-             "claude-dashboard usage: auto-resume queued for %s at %s (after %s)"
+             "llm-dashboard usage: auto-resume queued for %s at %s (after %s)"
              (buffer-name buf)
              (format-time-string "%H:%M" fire-time)
              when-text)))))))
 
 ;;; --- List buffer -----------------------------------------------------------
 
-(defvar claude-dashboard-usage-mode-map
+(defvar llm-dashboard-usage-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map tabulated-list-mode-map)
-    (define-key map "g" #'claude-dashboard-usage-list-refresh)
-    (define-key map "n" #'claude-dashboard-usage-now)
+    (define-key map "g" #'llm-dashboard-usage-list-refresh)
+    (define-key map "n" #'llm-dashboard-usage-now)
     map)
-  "Keymap for `claude-dashboard-usage-list-mode'.")
+  "Keymap for `llm-dashboard-usage-list-mode'.")
 
-(define-derived-mode claude-dashboard-usage-list-mode tabulated-list-mode
+(define-derived-mode llm-dashboard-usage-list-mode tabulated-list-mode
   "ClaudeUsage"
-  "List buffer for `claude-dashboard-usage-list'."
+  "List buffer for `llm-dashboard-usage-list'."
   (setq tabulated-list-format
         [("Instance"  28 t)
          ("State"     12 t)
@@ -423,21 +423,21 @@ is 0*, roll forward 24h."
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
 
-(defun claude-dashboard-usage-list-refresh ()
+(defun llm-dashboard-usage-list-refresh ()
   "Repopulate the *Claude Usage* buffer from the cache."
   (interactive)
-  (claude-dashboard-usage--refresh-all)
+  (llm-dashboard-usage--refresh-all)
   (setq tabulated-list-entries
         (cl-loop
-         for buf being the hash-keys of claude-dashboard--usage-cache
+         for buf being the hash-keys of llm-dashboard--usage-cache
          using (hash-values usage)
          when (buffer-live-p buf)
          collect
-         (let* ((state (and usage (claude-dashboard-usage-state usage)))
-                (label (and usage (claude-dashboard-usage-kind-label usage)))
-                (pct (and usage (claude-dashboard-usage-pct usage)))
-                (when-text (and usage (claude-dashboard-usage-when-text usage)))
-                (reset-time (and usage (claude-dashboard-usage-reset-time usage)))
+         (let* ((state (and usage (llm-dashboard-usage-state usage)))
+                (label (and usage (llm-dashboard-usage-kind-label usage)))
+                (pct (and usage (llm-dashboard-usage-pct usage)))
+                (when-text (and usage (llm-dashboard-usage-when-text usage)))
+                (reset-time (and usage (llm-dashboard-usage-reset-time usage)))
                 (resets-display
                  (cond ((and reset-time when-text)
                         (format "%s (parsed: %s)"
@@ -461,40 +461,40 @@ is 0*, roll forward 24h."
   (tabulated-list-print t))
 
 ;;;###autoload
-(defun claude-dashboard-usage-list ()
+(defun llm-dashboard-usage-list ()
   "Open the *Claude Usage* list buffer."
   (interactive)
   (let ((buf (get-buffer-create "*Claude Usage*")))
     (with-current-buffer buf
-      (claude-dashboard-usage-list-mode)
-      (claude-dashboard-usage-list-refresh))
+      (llm-dashboard-usage-list-mode)
+      (llm-dashboard-usage-list-refresh))
     (pop-to-buffer buf)))
 
 ;;; --- Background timer -----------------------------------------------------
 
-(defun claude-dashboard-usage--ensure-timer ()
+(defun llm-dashboard-usage--ensure-timer ()
   "Start the background scan timer if not already running."
-  (unless (and claude-dashboard--usage-timer
-               (memq claude-dashboard--usage-timer timer-list))
-    (setq claude-dashboard--usage-timer
+  (unless (and llm-dashboard--usage-timer
+               (memq llm-dashboard--usage-timer timer-list))
+    (setq llm-dashboard--usage-timer
           (run-with-timer
-           claude-dashboard-usage-scan-interval
-           claude-dashboard-usage-scan-interval
-           #'claude-dashboard-usage--refresh-all))))
+           llm-dashboard-usage-scan-interval
+           llm-dashboard-usage-scan-interval
+           #'llm-dashboard-usage--refresh-all))))
 
-(defun claude-dashboard-usage--cancel-timer ()
+(defun llm-dashboard-usage--cancel-timer ()
   "Stop the background scan timer."
-  (when claude-dashboard--usage-timer
-    (cancel-timer claude-dashboard--usage-timer)
-    (setq claude-dashboard--usage-timer nil)))
+  (when llm-dashboard--usage-timer
+    (cancel-timer llm-dashboard--usage-timer)
+    (setq llm-dashboard--usage-timer nil)))
 
 ;; Auto-start the timer once this module loads.
-(claude-dashboard-usage--ensure-timer)
+(llm-dashboard-usage--ensure-timer)
 
 ;;; --- Dashboard integration -------------------------------------------------
 
 (with-eval-after-load 'claude-dashboard
-  (define-key claude-dashboard-mode-map "U" #'claude-dashboard-usage-list))
+  (define-key llm-dashboard-mode-map "U" #'llm-dashboard-usage-list))
 
-(provide 'claude-dashboard-usage)
-;;; claude-dashboard-usage.el ends here
+(provide 'llm-dashboard-usage)
+;;; llm-dashboard-usage.el ends here
