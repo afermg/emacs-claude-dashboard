@@ -1074,4 +1074,5 @@ in place."
   (define-key llm-dashboard-mode-map "L" #'llm-dashboard-list-pending-sends))
 
 (provide 'llm-dashboard-schedule)
+(provide 'claude-dashboard-schedule)
 ;;; llm-dashboard-schedule.el ends here

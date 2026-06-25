@@ -497,4 +497,5 @@ is 0*, roll forward 24h."
   (define-key llm-dashboard-mode-map "U" #'llm-dashboard-usage-list))
 
 (provide 'llm-dashboard-usage)
+(provide 'claude-dashboard-usage)
 ;;; llm-dashboard-usage.el ends here

@@ -642,4 +642,5 @@ losing the cadence."
               #'llm-dashboard-list-recurring))
 
 (provide 'llm-dashboard-recurring)
+(provide 'claude-dashboard-recurring)
 ;;; llm-dashboard-recurring.el ends here
