@@ -154,6 +154,56 @@ too often and were removed:
 - Expensive lookups (branch name, project name, topic) are cached for
   30 s per instance.
 
+### Known traps
+
+#### A stray window on another frame shrinks the eat terminal
+
+`eat` resizes the PTY through Emacs' `set-process-window-size`, which
+defaults to `window-adjust-process-window-size-smallest` — when an eat
+buffer is displayed in **more than one** window (including across
+frames), the PTY is sized to the **smallest** of them. A leftover tiny
+frame (an old `emacsclient -c`, a popup that was never closed, a small
+side frame that still has an instance buffer in it) silently caps the
+TUI at e.g. 79×11 even when the main window is 270×60. The visible
+window stays huge, but the agent paints into a narrow band at the
+top-left.
+
+Diagnose by checking the eat buffer's window list across all frames
+and comparing to `(eat-term-size eat-terminal)`:
+
+```elisp
+(with-current-buffer "*claude-…*"
+  (list :term-size (eat-term-size eat-terminal)
+        :windows (mapcar (lambda (w)
+                           (list (frame-parameter (window-frame w) 'name)
+                                 (window-body-width w)
+                                 (window-body-height w)))
+                         (get-buffer-window-list (current-buffer) nil t))))
+```
+
+Fix by pointing the stray window away from the eat buffer, then
+re-running eat's adjust function:
+
+```elisp
+(let* ((buf (current-buffer))
+       (stray (seq-filter (lambda (w)
+                            (not (equal (frame-parameter (window-frame w) 'name) " ")))
+                          (get-buffer-window-list buf nil t))))
+  (dolist (w stray) (set-window-buffer w (get-buffer-create "*scratch*")))
+  (eat--adjust-process-window-size (get-buffer-process buf)
+                                   (get-buffer-window-list buf nil t))
+  (process-send-string (get-buffer-process buf) "\C-l"))
+```
+
+Don't switch `window-adjust-process-window-size-function` to
+`…-largest` globally — that changes comint/term/vterm sizing for the
+whole session.
+
+This is easy to hit with the dashboard because
+`claude-dashboard-instance-window-action` reuses any window already
+showing an instance — a stray frame holding an old instance buffer
+becomes the host for the *next* instance you visit.
+
 ### Process lifecycle
 
 The backend process runs as a direct Emacs subprocess inside an
