@@ -74,6 +74,7 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `w`   | copy the row's TOPIC to the kill ring                  |
 | `f`   | copy the row's cwd to the kill ring                    |
 | `T`   | interactive `/name <slug>` for the agent at point      |
+| `i`   | send the backend's in-band interrupt key to the row     |
 | `m` / `u`         | mark / unmark current row                  |
 | `t` / `U`         | toggle all marks / unmark all              |
 | `D`   | quit (graceful) marked, or current — also kills its buffer |
@@ -85,6 +86,12 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `R`   | resume picker (all past sessions, sorted newest-first); on a row, defaults to that cwd |
 | `g`   | refresh                                                |
 | `?`   | transient menu                                         |
+
+In a managed `eat` buffer, `C-c C-i` sends the backend's in-band interrupt
+key to the current agent.
+
+`M-x llm-dashboard-interrupt-instance` also works directly from a managed
+`eat` buffer, not just from the dashboard.
 
 `r` (restart) is **not** bound by default — restart spawns a fresh agent
 without a session resume, dropping the conversation, and a single-letter
@@ -155,6 +162,7 @@ opt out) drive the per-row column extractors:
 | `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives ACTIVITY, exchanges, first-prompt, turn-counts. |
 | `:list-sessions-fn`   | `() → list-of-past`      | Resumable session enumeration for the picker.      |
 | `:rename-fn`          | `(proc slug) → bool`     | Inject a rename command; `nil` means unsupported.  |
+| `:interrupt-fn`       | `(proc) → bool`          | Inject the backend's in-band abort key; `nil` means unsupported. |
 
 See the `llm-dashboard-backends` docstring for the complete shape
 and the `--claude-*-fn` / `--opencode-*-fn` / `--codex-*-fn`
@@ -181,9 +189,9 @@ too often and were removed:
 - Each row carries the latest activity (first sentence of Claude's most
   recent assistant text, or a `<Tool> <hint>` summary when the latest
   content item is a tool_use) and the conversation's TOPIC (the live
-  `~/.claude/sessions/<PID>.json` `name` field, updated on every
-  `/rename`, with a chain of fallbacks down to Claude's auto-assigned
-  slug).
+  backend name when available, then the transcript's recorded name,
+  then a worktree or prompt-derived slug, with `—` as the last
+  resort).
 - `TAB` on a row reveals the last user query (`❯ …`) and the latest
   assistant response. The full per-query / per-response history is a
   level deeper — magit's `1`/`2`/`3` (or `M-1`/`M-2`/`M-3` for whole
