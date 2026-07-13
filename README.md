@@ -1,7 +1,8 @@
-# claude-dashboard.el
+# llm-dashboard.el
 
 A magit-style Emacs buffer for managing TUI agent instances you launch
-from Emacs — Claude Code by default, with opt-in support for [opencode](https://opencode.ai/).
+from Emacs — Pi by default, with opt-in support for Claude Code,
+[opencode](https://opencode.ai/), and Codex.
 Each instance runs in its own [eat](https://codeberg.org/akib/emacs-eat)
 terminal buffer rooted at a project directory; the dashboard docks at the
 bottom of the frame and shows them as a single line each — project tag,
@@ -19,33 +20,39 @@ Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-secti
 [eat](https://codeberg.org/akib/emacs-eat). With straight.el:
 
 ```elisp
-(use-package claude-dashboard
+(use-package llm-dashboard
   :straight (:host github :repo "afermg/emacs-claude-dashboard"
-             :files ("claude-dashboard.el"))
-  :commands (claude-dashboard claude-dashboard-new
-             claude-dashboard-continue claude-dashboard-resume))
+             :files ("llm-dashboard.el"))
+  :commands (llm-dashboard llm-dashboard-new
+             llm-dashboard-continue llm-dashboard-resume))
 ```
 
 With `package-vc-install` (Emacs 29+, no straight.el needed):
 
 ```elisp
-(unless (package-installed-p 'claude-dashboard)
+(unless (package-installed-p 'llm-dashboard)
   (package-vc-install
-   '(claude-dashboard
+   '(llm-dashboard
      :url "https://github.com/afermg/emacs-claude-dashboard")))
-(require 'claude-dashboard)
+(require 'llm-dashboard)
 ```
 
 Or load manually:
 
 ```elisp
 (add-to-list 'load-path "/path/to/emacs-claude-dashboard")
-(require 'claude-dashboard)
+(require 'llm-dashboard)
 ```
+
+The package was renamed from `claude-dashboard` to `llm-dashboard` in
+this release. Transitional aliases at the bottom of `llm-dashboard.el`
+keep `(require 'claude-dashboard)`, `(use-package claude-dashboard ...)`,
+`M-x claude-dashboard`, and the `claude-dashboard-*` defcustoms working
+for one cycle so existing init files don't break.
 
 ## Use
 
-`M-x claude-dashboard` opens the dashboard. With the default settings it
+`M-x llm-dashboard` opens the dashboard. With the default settings it
 docks as a side window at the bottom of the frame, sized exactly to the
 number of instance rows (heading + column header + one line per agent).
 
@@ -72,16 +79,17 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `D`   | quit (graceful) marked, or current — also kills its buffer |
 | `x`   | kill eat buffer for marked, or current                 |
 | `k` / `K` | quit (also kills buffer) / kill buffer outright    |
-| `N`   | new Claude instance (prompts for cwd)                  |
-| `b`   | new git worktree + branch + agent (Claude Code's `.claude/worktrees/<branch>` layout) |
-| `c`   | `claude --continue` in chosen cwd                      |
+| `N`   | new agent instance (prompts for cwd)                   |
+| `b`   | new git worktree + branch + agent (backend-specific worktree layout) |
+| `c`   | continue the most recent session in chosen cwd         |
 | `R`   | resume picker (all past sessions, sorted newest-first); on a row, defaults to that cwd |
 | `g`   | refresh                                                |
 | `?`   | transient menu                                         |
 
-`r` (restart) is **not** bound by default — restart spawns a fresh `claude`
-without `--resume`, dropping the conversation, and a single-letter binding
-makes that footgun too easy. Reachable via `M-x claude-dashboard-restart`.
+`r` (restart) is **not** bound by default — restart spawns a fresh agent
+without a session resume, dropping the conversation, and a single-letter
+binding makes that footgun too easy. Reachable via
+`M-x llm-dashboard-restart`.
 
 Project root selection offers `project-known-project-roots` first, then
 directories from `recentf-list`, then a free-form `read-directory-name`.
@@ -90,34 +98,67 @@ directories from `recentf-list`, then a free-form `read-directory-name`.
 
 The dashboard multiplexes over backend CLIs that share the same shape
 (a TUI agent, a per-user state directory, a `--resume` / `--continue`
-convention). Two are wired up out of the box:
+convention). Three are wired up out of the box:
 
-| Backend  | Program    | State dir                       | Status                              |
-| -------- | ---------- | ------------------------------- | ----------------------------------- |
-| `claude` | `claude`   | `~/.claude`                     | Default; full feature set.          |
-| `opencode` | `opencode` | `~/.local/share/opencode`       | Process / launch / manifest / resume; transcript-derived columns (topic, model, last activity, exchange body, kind-classifier) currently stub out because opencode's on-disk schema is SQLite, not Claude's per-session JSONL. |
+| Backend    | Program    | State dir                  | Transcripts | Status                                       |
+| ---------- | ---------- | -------------------------- | ----------- | -------------------------------------------- |
+| `pi`       | `pi`       | `~/.pi/agent`              | Session JSONL | Full support; default — session discovery, topic, activity, and `/name` via split-write. |
+| `claude`   | `claude`   | `~/.claude`                | JSONL         | Full support; includes kind classifier. |
+| `opencode` | `opencode` | `~/.local/share/opencode`  | SQLite        | Full support — sessions, topic, activity, exchange body via the built-in SQLite reader. No `/rename` (opencode lacks the slash command). Requires Emacs built with `--with-sqlite3` (Emacs 30 default). |
+| `codex`    | `codex`    | `~/.codex`                 | Rollout JSONL | Full support — session discovery, topic, activity, and `/rename` via split-write. Topic falls back to the worktree slug since codex has no live name file. |
 
 Switch with a single defcustom:
 
 ```elisp
-;; Default — Claude Code
-(setq claude-dashboard-backend 'claude)
+;; Default — Pi
+(setq llm-dashboard-backend 'pi)
 
-;; Or opt in to opencode
-(setq claude-dashboard-backend 'opencode)
+;; Or switch to another backend
+(setq llm-dashboard-backend 'claude)
+(setq llm-dashboard-backend 'opencode)
+(setq llm-dashboard-backend 'codex)
 ```
 
-The `claude-dashboard-program`, `claude-dashboard-claude-dir`,
-`claude-dashboard-spinner-regexp`, and `claude-dashboard-manifest-file`
+`llm-dashboard-backend` only controls the **default** for new
+sessions. Each instance captures its backend symbol at launch time
+into a `:backend` struct slot and persists it in the manifest, so a
+single dashboard can mix pi / claude / opencode / codex rows side by side —
+every row dispatches its own session-id, topic, activity, and rename
+through the adapter it was launched against.
+
+Each row's TOPIC column gets a one-glyph colored badge — `P` for
+pi, `C` for claude, `O` for opencode, `X` for codex — so multi-backend dashboards
+are visually distinguishable without an extra column.
+
+The `llm-dashboard-program`, `llm-dashboard-claude-dir`,
+`llm-dashboard-spinner-regexp`, and `llm-dashboard-manifest-file`
 defcustoms still work — when set, they override the backend defaults,
 which is useful for pinning an absolute path or sharing a manifest
 across backends. Leave them at their nil / `auto` defaults to let the
 active backend supply the value.
 
-Adding a new backend means adding an entry to `claude-dashboard-backends`
-with `:program`, `:state-dir`, `:spinner-regexp`, `:resume-flag`,
-`:continue-flag`, `:worktree-subdir`, and `:transcript-style`. See the
-`claude-dashboard-backends` docstring for the full key list.
+### Adding a new backend
+
+Append an entry to `llm-dashboard-backends`. The static keys are
+`:program`, `:state-dir`, `:spinner-regexp`, `:resume-flag`,
+`:continue-flag`, `:worktree-subdir`, `:transcript-style`, `:badge`,
+`:badge-color`, and `:supports-auto-name`.
+
+The function-valued keys (each a symbol naming a defun, or `nil` to
+opt out) drive the per-row column extractors:
+
+| Slot                  | Signature                | Purpose                                            |
+| --------------------- | ------------------------ | -------------------------------------------------- |
+| `:session-id-fn`      | `(inst) → sid \| nil`    | Discover the live session-id for INST.             |
+| `:session-name-fn`    | `(inst) → name \| nil`   | Live user-set name (post-`/rename`).               |
+| `:transcript-path-fn` | `(cwd sid) → path \| nil`| Locate the transcript for a given session.         |
+| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives ACTIVITY, exchanges, first-prompt, turn-counts. |
+| `:list-sessions-fn`   | `() → list-of-past`      | Resumable session enumeration for the picker.      |
+| `:rename-fn`          | `(proc slug) → bool`     | Inject a rename command; `nil` means unsupported.  |
+
+See the `llm-dashboard-backends` docstring for the complete shape
+and the `--claude-*-fn` / `--opencode-*-fn` / `--codex-*-fn`
+implementations for working examples.
 
 ## Behavior notes
 
@@ -135,7 +176,7 @@ too often and were removed:
 ### Layout
 
 - The dashboard docks via `display-buffer-in-side-window` at
-  `claude-dashboard-side` (default `bottom`), with `window-height = fit-window-to-buffer`.
+  `llm-dashboard-side` (default `bottom`), with `window-height = fit-window-to-buffer`.
   It re-sizes on every refresh as instances appear and disappear.
 - Each row carries the latest activity (first sentence of Claude's most
   recent assistant text, or a `<Tool> <hint>` summary when the latest
@@ -154,56 +195,6 @@ too often and were removed:
 - Expensive lookups (branch name, project name, topic) are cached for
   30 s per instance.
 
-### Known traps
-
-#### A stray window on another frame shrinks the eat terminal
-
-`eat` resizes the PTY through Emacs' `set-process-window-size`, which
-defaults to `window-adjust-process-window-size-smallest` — when an eat
-buffer is displayed in **more than one** window (including across
-frames), the PTY is sized to the **smallest** of them. A leftover tiny
-frame (an old `emacsclient -c`, a popup that was never closed, a small
-side frame that still has an instance buffer in it) silently caps the
-TUI at e.g. 79×11 even when the main window is 270×60. The visible
-window stays huge, but the agent paints into a narrow band at the
-top-left.
-
-Diagnose by checking the eat buffer's window list across all frames
-and comparing to `(eat-term-size eat-terminal)`:
-
-```elisp
-(with-current-buffer "*claude-…*"
-  (list :term-size (eat-term-size eat-terminal)
-        :windows (mapcar (lambda (w)
-                           (list (frame-parameter (window-frame w) 'name)
-                                 (window-body-width w)
-                                 (window-body-height w)))
-                         (get-buffer-window-list (current-buffer) nil t))))
-```
-
-Fix by pointing the stray window away from the eat buffer, then
-re-running eat's adjust function:
-
-```elisp
-(let* ((buf (current-buffer))
-       (stray (seq-filter (lambda (w)
-                            (not (equal (frame-parameter (window-frame w) 'name) " ")))
-                          (get-buffer-window-list buf nil t))))
-  (dolist (w stray) (set-window-buffer w (get-buffer-create "*scratch*")))
-  (eat--adjust-process-window-size (get-buffer-process buf)
-                                   (get-buffer-window-list buf nil t))
-  (process-send-string (get-buffer-process buf) "\C-l"))
-```
-
-Don't switch `window-adjust-process-window-size-function` to
-`…-largest` globally — that changes comint/term/vterm sizing for the
-whole session.
-
-This is easy to hit with the dashboard because
-`claude-dashboard-instance-window-action` reuses any window already
-showing an instance — a stray frame holding an old instance buffer
-becomes the host for the *next* instance you visit.
-
 ### Process lifecycle
 
 The backend process runs as a direct Emacs subprocess inside an
@@ -215,31 +206,31 @@ they introduced into eat to be worth the survival benefit.  If you
 need to pick a conversation back up after restart, the per-session
 transcripts live at `<state-dir>/projects/<slug>/<sid>.jsonl` (for
 Claude: `~/.claude/projects/…`) and `claude --resume <sid>` works on
-a fresh launch.  Use `M-x claude-dashboard-resume-all` to relaunch
+a fresh launch.  Use `M-x llm-dashboard-resume-all` to relaunch
 every session recorded in the manifest.
 
 ## Customization
 
 ```elisp
-;; Backend selection (default `claude'; `opencode' also supported)
-(setq claude-dashboard-backend 'claude)
+;; Backend selection (default `pi'; `claude', `opencode', and `codex' also supported)
+(setq llm-dashboard-backend 'pi)
 
 ;; Process / launch — leave program/state-dir nil to inherit from backend
-(setq claude-dashboard-program nil                   ;; or "claude" / abs path
-      claude-dashboard-program-args nil              ;; extra CLI args
-      claude-dashboard-claude-dir nil)               ;; nil = backend default
+(setq llm-dashboard-program nil                   ;; or "claude" / abs path
+      llm-dashboard-program-args nil              ;; extra CLI args
+      llm-dashboard-claude-dir nil)               ;; nil = backend default
 
 ;; Layout
-(setq claude-dashboard-fit-window t                  ;; nil = use default
-      claude-dashboard-fit-min-height 4
-      claude-dashboard-side 'bottom)                 ;; 'top or 'bottom
+(setq llm-dashboard-fit-window t                  ;; nil = use default
+      llm-dashboard-fit-min-height 4
+      llm-dashboard-side 'bottom)                 ;; 'top or 'bottom
 
 ;; Refresh + classifier (nil spinner-regexp = backend default)
-(setq claude-dashboard-refresh-interval 5
-      claude-dashboard-cache-ttl 30
-      claude-dashboard-tail-chars 2000
-      claude-dashboard-spinner-regexp nil)
+(setq llm-dashboard-refresh-interval 5
+      llm-dashboard-cache-ttl 30
+      llm-dashboard-tail-chars 2000
+      llm-dashboard-spinner-regexp nil)
 
 ;; Auto-naming
-(setq claude-dashboard-auto-name-after-turns 5)      ;; nil disables
+(setq llm-dashboard-auto-name-after-turns 5)      ;; nil disables
 ```
