@@ -2,17 +2,18 @@
 
 ;; Author: Alán F. Muñoz
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.5") (eat "0.9"))
+;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.5") (eat "0.9") (ghostel "0.44.0"))
 ;; Keywords: tools, processes
 ;; URL: https://github.com/afermg/emacs-claude-dashboard
 
 ;;; Commentary:
 
 ;; A single buffer that lists coding-agent CLI instances launched from
-;; Emacs (Pi, Claude Code, opencode, codex), each running in its own eat
-;; terminal buffer rooted at a project directory.  Press `n' to launch
-;; a new instance, RET to jump in, `k' to exit it gracefully, `g' to
-;; refresh, `?' for the transient menu.
+;; Emacs (Pi, Claude Code, opencode, codex), each running in its own
+;; terminal buffer rooted at a project directory.  `eat' and `ghostel'
+;; are both supported as terminal backends.  Press `n' to launch a new
+;; instance, RET to jump in, `k' to exit it gracefully, `g' to refresh,
+;; `?' for the transient menu.
 ;;
 ;; The package was renamed from `claude-dashboard' to `llm-dashboard'.
 ;; Transitional `defvaralias' / `defalias' shims at the bottom of this
@@ -27,6 +28,7 @@
 (require 'project)
 (require 'recentf)
 (require 'eat)
+(require 'ghostel nil t)
 
 (defgroup llm-dashboard nil
   "Dashboard for managing coding-agent instances."
@@ -149,7 +151,7 @@ following static slots:
 
   :program          Executable name used to launch a session.
   :state-dir        Per-user state directory the backend writes to.
-  :spinner-regexp   Regex matched in the eat tail to detect `running'.
+  :spinner-regexp   Regex matched in the terminal tail to detect `running'.
   :resume-flag      CLI flag for resuming a session by id.
   :continue-flag    CLI flag for resuming the most recent session.
   :worktree-subdir  Relative path under the main worktree where new
@@ -177,13 +179,34 @@ for unsupported):
                     Backend-agnostic column extractors consume this.
   :list-sessions-fn () → list of `llm-dashboard-past-session'
                     structs, newest-first.
-  :rename-fn        (PROC SLUG) → non-nil on successful injection;
+  :rename-fn        (INST SLUG) → non-nil on successful injection;
                     nil when the backend has no rename slash command.
-  :interrupt-fn     (PROC) → non-nil on successful in-band interrupt;
+  :interrupt-fn     (INST) → non-nil on successful in-band interrupt;
                     nil when the backend has no TUI interrupt key."
   :type '(alist :key-type symbol
                 :value-type (plist :key-type symbol :value-type sexp))
   :group 'llm-dashboard)
+
+(defun llm-dashboard--normalize-backend-plists ()
+  "Backfill backend slots that may be missing after interactive reloads.
+
+`defcustom' does not overwrite an already-bound variable on `load-file',
+so newly-added plist keys must be normalized explicitly."
+  (setq llm-dashboard-backends
+        (mapcar
+         (lambda (entry)
+           (pcase-let ((`(,name . ,plist) entry))
+             (cons name
+                   (pcase name
+                     ('opencode
+                      (plist-put plist :interrupt-fn nil))
+                     ((or 'pi 'claude 'codex)
+                      (plist-put plist :interrupt-fn
+                                 'llm-dashboard--escape-interrupt-fn))
+                     (_ plist)))))
+         llm-dashboard-backends)))
+
+(llm-dashboard--normalize-backend-plists)
 
 (defun llm-dashboard--backend-plist (&optional name)
   "Return the plist for backend NAME (or the active backend)."
@@ -280,6 +303,41 @@ pin it regardless of the active backend."
   (or llm-dashboard-claude-dir
       (llm-dashboard--backend-prop :state-dir)))
 
+(defcustom llm-dashboard-terminal-backend 'eat
+  "Terminal emulator used for newly-launched dashboard sessions.
+Supported values are `eat' and `ghostel'.  Existing sessions keep
+using whichever terminal backend their buffer is already running."
+  :type '(choice (const :tag "Eat" eat)
+                 (const :tag "Ghostel" ghostel))
+  :group 'llm-dashboard)
+
+(defun llm-dashboard--resolve-terminal-backend (&optional backend)
+  "Return BACKEND when available, otherwise fall back to `eat'."
+  (pcase (or backend llm-dashboard-terminal-backend)
+    ('ghostel
+     (if (or (featurep 'ghostel) (require 'ghostel nil t))
+         'ghostel
+       'eat))
+    (_
+     (require 'eat)
+     'eat)))
+
+(defun llm-dashboard--buffer-terminal-backend (&optional buffer)
+  "Return BUFFER's terminal backend, falling back to the configured default."
+  (let ((buf (or buffer (current-buffer))))
+    (if (not (buffer-live-p buf))
+        (llm-dashboard--resolve-terminal-backend)
+      (with-current-buffer buf
+        (cond
+         ((derived-mode-p 'ghostel-mode) 'ghostel)
+         ((derived-mode-p 'eat-mode) 'eat)
+         (t (llm-dashboard--resolve-terminal-backend)))))))
+
+(defun llm-dashboard--instance-terminal-backend (inst)
+  "Return INST's terminal backend."
+  (llm-dashboard--buffer-terminal-backend
+   (llm-dashboard-instance-buffer inst)))
+
 ;;; Data model
 
 (cl-defstruct llm-dashboard-instance
@@ -295,7 +353,7 @@ pin it regardless of the active backend."
   project-name-cache)
 
 (defvar llm-dashboard--instances (make-hash-table :test 'eq)
-  "Map from eat buffer to `llm-dashboard-instance' struct.")
+  "Map from managed terminal buffer to `llm-dashboard-instance' struct.")
 
 (defvar llm-dashboard--marks (make-hash-table :test 'eq)
   "Set of marked instance buffers (value t).")
@@ -324,19 +382,63 @@ against rather than what the worktree currently points at.")
     (nreverse result)))
 
 (defun llm-dashboard--instance-process (inst)
-  "Return the live process object of INST's eat buffer, or nil."
+  "Return INST's live terminal process object, or nil."
   (when (buffer-live-p (llm-dashboard-instance-buffer inst))
-    (get-buffer-process (llm-dashboard-instance-buffer inst))))
+    (with-current-buffer (llm-dashboard-instance-buffer inst)
+      (pcase (llm-dashboard--buffer-terminal-backend (current-buffer))
+        ('ghostel (and (boundp 'ghostel--process) ghostel--process))
+        (_ (get-buffer-process (current-buffer)))))))
 
-(defun llm-dashboard--escape-interrupt-fn (proc)
-  "Inject an Escape keypress into PROC's PTY."
-  (when (and proc (process-live-p proc))
-    (process-send-string proc "\e")
-    t))
+(defun llm-dashboard--terminal-send-string (buffer string)
+  "Send STRING to BUFFER's managed terminal."
+  (when (and (buffer-live-p buffer) (stringp string))
+    (pcase (llm-dashboard--buffer-terminal-backend buffer)
+      ('ghostel
+       (with-current-buffer buffer
+         (require 'ghostel)
+         (ghostel-send-string string)
+         t))
+      (_
+       (when-let ((proc (get-buffer-process buffer)))
+         (process-send-string proc string)
+         t)))))
 
-(defun llm-dashboard--install-eat-keybindings ()
-  "Install local llm-dashboard bindings in the current managed eat buffer."
-  (local-set-key (kbd "C-c C-i") #'llm-dashboard-interrupt-instance))
+(defun llm-dashboard--escape-interrupt-fn (inst)
+  "Inject an Escape keypress into INST's terminal."
+  (when-let ((buf (and inst (llm-dashboard-instance-buffer inst))))
+    (llm-dashboard--terminal-send-string buf "\e")))
+
+(defvar llm-dashboard-managed-terminal-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-i") #'llm-dashboard-interrupt-instance)
+    map)
+  "Keymap enabled in llm-dashboard-managed terminal buffers.
+
+Add custom bindings here to make them available in every managed
+terminal, for example:
+
+  (define-key llm-dashboard-managed-terminal-mode-map
+              (kbd \"M-<up>\") (function my-command))")
+
+(define-minor-mode llm-dashboard-managed-terminal-mode
+  "Minor mode active in llm-dashboard-managed terminal buffers.
+
+This mode exposes `llm-dashboard-managed-terminal-mode-map' so users can
+add custom bindings without mutating the shared Eat or Ghostel keymaps."
+  :init-value nil
+  :lighter nil)
+
+(defvar llm-dashboard--managed-terminal-emulation-map-alist
+  `((llm-dashboard-managed-terminal-mode
+     . ,llm-dashboard-managed-terminal-mode-map))
+  "Emulation-map entry for `llm-dashboard-managed-terminal-mode'.")
+
+(add-to-list 'emulation-mode-map-alists
+             'llm-dashboard--managed-terminal-emulation-map-alist)
+
+(defun llm-dashboard--install-terminal-keybindings ()
+  "Enable llm-dashboard bindings in the current managed terminal buffer."
+  (llm-dashboard-managed-terminal-mode 1))
 
 ;;; --- Phase classification (stub) ----------------------------------------
 ;; Real definitions live below `llm-dashboard-name-instance' so they sit
@@ -465,7 +567,7 @@ absent.  Fires once per buffer."
                         inst)))))
         (when (and slug (not (string-empty-p slug)))
           (puthash buf t llm-dashboard--name-injected)
-          (when (llm-dashboard--backend-call :rename-fn backend proc slug)
+          (when (llm-dashboard--backend-call :rename-fn backend inst slug)
             (remhash buf llm-dashboard--topic-cache)
             (message "llm-dashboard: named %s → %s"
                      (buffer-name buf) slug)))))))
@@ -502,7 +604,7 @@ signals when the backend does not support renaming."
       (user-error "Instance has no live process"))
     (unless (llm-dashboard--backend-prop :rename-fn backend)
       (user-error "Backend %s does not support renaming" backend))
-    (if (llm-dashboard--backend-call :rename-fn backend proc name)
+    (if (llm-dashboard--backend-call :rename-fn backend inst name)
         (progn
           (puthash (llm-dashboard-instance-buffer inst) t
                    llm-dashboard--name-injected)
@@ -516,7 +618,7 @@ signals when the backend does not support renaming."
 ;;
 ;; Three phases:
 ;;   `exited'   OS process is gone.
-;;   `running'  Spinner (`esc to interrupt') visible in the eat tail.
+;;   `running'  Spinner (`esc to interrupt') visible in the terminal tail.
 ;;   `idle'     Process alive, no spinner.
 ;;
 ;; Earlier versions tried to detect `awaiting' (a pending menu / question)
@@ -553,7 +655,7 @@ dashboard ends up at the minimum height that shows all rows."
   :type '(choice (const top) (const bottom)) :group 'llm-dashboard)
 
 (defcustom llm-dashboard-tail-chars 2000
-  "Trailing eat-buffer chars used by `llm-dashboard--status'.
+  "Trailing terminal-buffer chars used by `llm-dashboard--status'.
 Wide enough to catch the spinner across the framing borders that may
 sit between it and point-max."
   :type 'integer :group 'llm-dashboard)
@@ -962,7 +1064,10 @@ the same way."
   (let ((backend (llm-dashboard--instance-backend inst)))
     (when-let ((sid (llm-dashboard--backend-call
                      :session-id-fn backend inst)))
-      (setf (llm-dashboard-instance-session-id inst) sid))
+      (unless (equal sid (llm-dashboard-instance-session-id inst))
+        (setf (llm-dashboard-instance-session-id inst) sid)
+        (remhash (llm-dashboard-instance-buffer inst)
+                 llm-dashboard--topic-cache)))
     (when (and (eq backend 'claude)
                (not (llm-dashboard-instance-model inst)))
       (let* ((cwd (llm-dashboard-instance-cwd inst))
@@ -1191,21 +1296,16 @@ content.  Either field may be nil."
      t)
     (list :user last-user :asst last-asst)))
 
-;;; Activity tracking via eat-update-hook
+;;; Activity tracking via terminal hooks
 
 (defvar-local llm-dashboard--last-eat-pmax nil
-  "Buffer-local: last `point-max' we observed when noting activity.
-Compared in `llm-dashboard--note-activity' so cosmetic eat
+  "Buffer-local: last `point-max' we observed in an eat buffer.
+Compared in `llm-dashboard--note-eat-activity' so cosmetic eat
 redraws (cursor blinks, focus changes, status-line repaints) do
 not get counted as new output — they don't grow the buffer.")
 
-(defun llm-dashboard--note-activity ()
-  "Bump last-output only when the eat buffer actually grew.
-`eat-update-hook' fires on every redraw, including ones triggered
-by switching focus into the eat buffer.  Real output from the
-agent appends to the buffer (point-max grows); cosmetic redraws
-don't.  Gating on size growth keeps focus from flipping a row's
-status to RUN."
+(defun llm-dashboard--note-eat-activity ()
+  "Bump last-output only when the managed eat buffer actually grew."
   (let* ((inst (gethash (current-buffer) llm-dashboard--instances))
          (pmax (point-max)))
     (when inst
@@ -1214,6 +1314,49 @@ status to RUN."
         (setf (llm-dashboard-instance-last-output inst) (float-time))
         (remhash (current-buffer) llm-dashboard--topic-cache))
       (setq llm-dashboard--last-eat-pmax pmax))))
+
+(defun llm-dashboard--note-ghostel-activity (&rest _)
+  "Bump last-output on textual ghostel buffer changes."
+  (let ((inst (gethash (current-buffer) llm-dashboard--instances)))
+    (when inst
+      (setf (llm-dashboard-instance-last-output inst) (float-time))
+      (remhash (current-buffer) llm-dashboard--topic-cache))))
+
+(defun llm-dashboard--configure-managed-terminal (buffer)
+  "Apply llm-dashboard local settings to managed terminal BUFFER."
+  (with-current-buffer buffer
+    (pcase (llm-dashboard--buffer-terminal-backend buffer)
+      ('ghostel
+       (setq-local ghostel-kill-buffer-on-exit nil)
+       (add-hook 'after-change-functions
+                 #'llm-dashboard--note-ghostel-activity nil t))
+      (_
+       (setq-local eat-kill-buffer-on-exit nil)
+       (add-hook 'eat-update-hook #'llm-dashboard--note-eat-activity nil t)))
+    (llm-dashboard--install-terminal-keybindings)
+    (add-hook 'kill-buffer-hook #'llm-dashboard--on-buffer-killed nil t)))
+
+(defun llm-dashboard--launch-terminal (buffer name cwd program args
+                                              &optional terminal-backend)
+  "Run PROGRAM with ARGS in BUFFER rooted at CWD.
+TERMINAL-BACKEND defaults to `llm-dashboard-terminal-backend'."
+  (let ((backend (llm-dashboard--resolve-terminal-backend terminal-backend)))
+    (with-current-buffer buffer
+      (setq-local default-directory cwd))
+    (pcase backend
+      ('ghostel
+       (require 'ghostel)
+       (ghostel-exec buffer program args))
+      (_
+       (with-current-buffer buffer
+         ;; Eat's shell-prompt annotation reserves a one-column left margin.
+         ;; Backends like Claude Code are TUI apps, not shells — the column
+         ;; shifts the whole frame right and clips the right edge of the
+         ;; boxed prompt, producing an apparent extra wrap line.  Disable it
+         ;; before `eat-mode' runs so the margin isn't installed.
+         (setq-local eat-enable-shell-prompt-annotation nil)
+         (unless (derived-mode-p 'eat-mode) (eat-mode))
+         (eat-exec buffer name program nil args))))))
 
 ;;; Launch
 
@@ -1403,11 +1546,7 @@ BACKEND defaults to the currently-active `llm-dashboard-backend'."
     (puthash buffer inst llm-dashboard--instances)
     (when deploy-branch
       (puthash buffer deploy-branch llm-dashboard--deploy-branches))
-    (with-current-buffer buffer
-      (setq-local eat-kill-buffer-on-exit nil)
-      (llm-dashboard--install-eat-keybindings)
-      (add-hook 'kill-buffer-hook #'llm-dashboard--on-buffer-killed nil t)
-      (add-hook 'eat-update-hook #'llm-dashboard--note-activity nil t))
+    (llm-dashboard--configure-managed-terminal buffer)
     (run-at-time 2 nil #'llm-dashboard--enrich-instance inst)
     (llm-dashboard--write-manifest)
     inst))
@@ -1524,20 +1663,11 @@ weeks ago doesn't surprise you."
 
 (defun llm-dashboard--launch (cwd extra-args)
   "Launch the active backend in CWD with EXTRA-ARGS, register, refresh, pop."
-  (let* ((default-directory cwd)
-         (name (llm-dashboard--unique-buffer-name cwd))
+  (let* ((name (llm-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (program (llm-dashboard--program))
          (args (append llm-dashboard-program-args extra-args)))
-    (with-current-buffer buf
-      ;; Eat's shell-prompt annotation reserves a one-column left margin.
-      ;; Backends like Claude Code are TUI apps, not shells — the column
-      ;; shifts the whole frame right and clips the right edge of the
-      ;; boxed prompt, producing an apparent extra wrap line.  Disable it
-      ;; before `eat-mode' runs so the margin isn't installed.
-      (setq-local eat-enable-shell-prompt-annotation nil)
-      (unless (derived-mode-p 'eat-mode) (eat-mode))
-      (eat-exec buf name program nil args))
+    (llm-dashboard--launch-terminal buf name cwd program args)
     (llm-dashboard--register buf cwd)
     (llm-dashboard--maybe-refresh)
     (pop-to-buffer buf llm-dashboard-instance-window-action)
@@ -1545,7 +1675,7 @@ weeks ago doesn't surprise you."
 
 ;;;###autoload
 (defun llm-dashboard-new (cwd)
-  "Launch a new backend instance in CWD as an eat buffer."
+  "Launch a new backend instance in CWD as a terminal buffer."
   (interactive (list (llm-dashboard--read-project)))
   (llm-dashboard--launch cwd nil))
 
@@ -1638,13 +1768,13 @@ With prefix arg or when called from a row, restrict to that row's cwd."
     val))
 
 (defun llm-dashboard--command-instance ()
-  "Return the current instance from the dashboard or a managed eat buffer."
+  "Return the current instance from the dashboard or a managed terminal buffer."
   (cond
    ((derived-mode-p 'llm-dashboard-mode)
     (llm-dashboard--current-instance))
    ((gethash (current-buffer) llm-dashboard--instances))
    (t
-    (user-error "Not in an llm-dashboard row or managed eat buffer"))))
+    (user-error "Not in an llm-dashboard row or managed terminal buffer"))))
 
 (defun llm-dashboard--reuse-instance-window (buffer alist)
   "`display-buffer' action: reuse any window already showing an instance.
@@ -1674,7 +1804,7 @@ opening a new window when no instance is shown yet."
   :type 'sexp :group 'llm-dashboard)
 
 (defun llm-dashboard-visit (inst)
-  "Pop to INST's eat buffer.
+  "Pop to INST's terminal buffer.
 Reuses the window currently showing another instance, so visiting
 a second agent replaces the first one in place rather than piling
 up windows.  See `llm-dashboard-instance-window-action'."
@@ -1683,7 +1813,7 @@ up windows.  See `llm-dashboard-instance-window-action'."
                  llm-dashboard-instance-window-action))
 
 (defun llm-dashboard-display (inst)
-  "Display INST's eat buffer without selecting it.
+  "Display INST's terminal buffer without selecting it.
 Reuses an existing instance window if one is visible."
   (interactive (list (llm-dashboard--current-instance)))
   (display-buffer (llm-dashboard-instance-buffer inst)
@@ -1780,7 +1910,7 @@ Reuses an existing instance window if one is visible."
       (llm-dashboard--maybe-refresh))))
 
 (defun llm-dashboard-do-kill ()
-  "Kill the eat buffer of all marked instances (or the one at point)."
+  "Kill the terminal buffer of all marked instances (or the one at point)."
   (interactive)
   (let ((targets (llm-dashboard--instances-for-bulk)))
     (when (or (null (cdr targets))
@@ -1794,10 +1924,10 @@ Reuses an existing instance window if one is visible."
   "Request an in-band interrupt for INST's running agent.
 
 Unlike `interrupt-process', this sends the backend's terminal-level
-abort key (Escape for Pi, Claude, and Codex) through the eat PTY, so
-it behaves like pressing the interrupt key inside the TUI.  This
-command works both from the dashboard row and directly from the
-managed eat buffer."
+abort key (Escape for Pi, Claude, and Codex) through the managed
+terminal buffer, so it behaves like pressing the interrupt key inside
+the TUI.  This command works both from the dashboard row and directly
+from the managed terminal buffer."
   (interactive (list (llm-dashboard--command-instance)))
   (let* ((backend (llm-dashboard--instance-backend inst))
          (proc (llm-dashboard--instance-process inst))
@@ -1805,17 +1935,17 @@ managed eat buffer."
     (unless proc (user-error "No live process"))
     (unless fn
       (user-error "Backend %s does not define an in-band interrupt" backend))
-    (unless (llm-dashboard--backend-call :interrupt-fn backend proc)
+    (unless (llm-dashboard--backend-call :interrupt-fn backend inst)
       (user-error "Failed to interrupt %s" backend))
     (message "Sent interrupt to %s" backend)))
 
 (defun llm-dashboard-quit-instance (inst)
-  "Send a graceful quit to INST's claude process and kill its eat buffer."
+  "Send a graceful quit to INST's agent process and kill its terminal buffer."
   (interactive (list (llm-dashboard--current-instance)))
   (let ((proc (llm-dashboard--instance-process inst))
         (buf (llm-dashboard-instance-buffer inst)))
     (unless proc (user-error "No live process"))
-    (interrupt-process proc)
+    (ignore-errors (interrupt-process proc))
     (run-at-time
      1 nil
      (lambda ()
@@ -1827,7 +1957,7 @@ managed eat buffer."
        (llm-dashboard--maybe-refresh)))))
 
 (defun llm-dashboard-kill-buffer (inst)
-  "Kill INST's eat buffer outright."
+  "Kill INST's terminal buffer outright."
   (interactive (list (llm-dashboard--current-instance)))
   (let ((buf (llm-dashboard-instance-buffer inst)))
     (when (buffer-live-p buf)
@@ -1836,20 +1966,19 @@ managed eat buffer."
   (llm-dashboard--maybe-refresh))
 
 (defun llm-dashboard-restart (inst)
-  "Restart INST's claude in the same eat buffer."
+  "Restart INST's agent in the same terminal buffer."
   (interactive (list (llm-dashboard--current-instance)))
-  (let ((buf (llm-dashboard-instance-buffer inst))
-        (cwd (llm-dashboard-instance-cwd inst)))
+  (let* ((buf (llm-dashboard-instance-buffer inst))
+         (cwd (llm-dashboard-instance-cwd inst))
+         (terminal-backend (llm-dashboard--instance-terminal-backend inst)))
     (unless (buffer-live-p buf) (user-error "Buffer is gone"))
-    (when-let ((proc (get-buffer-process buf)))
-      (set-process-query-on-exit-flag proc nil))
-    (with-current-buffer buf
-      (let ((default-directory cwd)
-            (inhibit-read-only t))
-        ;; eat-exec blasts any running process in BUF for us.
-        (eat-exec buf (buffer-name buf)
-                  (llm-dashboard--program) nil
-                  llm-dashboard-program-args)))
+    (when-let ((proc (llm-dashboard--instance-process inst)))
+      (set-process-query-on-exit-flag proc nil)
+      (ignore-errors (delete-process proc)))
+    (llm-dashboard--launch-terminal
+     buf (buffer-name buf) cwd
+     (llm-dashboard--program) llm-dashboard-program-args
+     terminal-backend)
     (let ((inst2 (gethash buf llm-dashboard--instances)))
       (when inst2
         (setf (llm-dashboard-instance-started-at inst2) (float-time))
@@ -2496,12 +2625,12 @@ side window survives both commands."
       (llm-dashboard--maybe-refresh))))
 
 (defvar llm-dashboard--last-selected-instance-buffer nil
-  "Most recent managed eat buffer that triggered a dashboard refresh.
+  "Most recent managed terminal buffer that triggered a dashboard refresh.
 Used to avoid redundant refreshes when buffer-selection hooks fire
 multiple times for the same switch.")
 
 (defun llm-dashboard--refresh-on-buffer-switch (&rest args)
-  "Refresh the dashboard after switching into a different managed eat buffer.
+  "Refresh the dashboard after switching into a different managed terminal buffer.
 This catches switches that don't emit a size-change event (for example,
 when a different dashboard session uses a different buffer-local zoom)
 so the visible layout reflows immediately."
@@ -2695,11 +2824,14 @@ messages and tool-result-only user turns are filtered out."
                 (time-less-p (llm-dashboard-past-session-mtime b)
                              (llm-dashboard-past-session-mtime a))))))
 
-(defun llm-dashboard--claude-rename-fn (proc slug)
-  "Claude `:rename-fn' — inject `/name SLUG\\n' into PROC's PTY."
-  (when (and proc (process-live-p proc) slug (not (string-empty-p slug)))
-    (process-send-string proc (format "/name %s\n" slug))
-    t))
+(defun llm-dashboard--claude-rename-fn (inst slug)
+  "Claude `:rename-fn' — inject `/name SLUG\\n' into INST's terminal."
+  (let ((proc (and inst (llm-dashboard--instance-process inst)))
+        (buf (and inst (llm-dashboard-instance-buffer inst))))
+    (when (and proc (process-live-p proc) (buffer-live-p buf)
+               slug (not (string-empty-p slug)))
+      (llm-dashboard--terminal-send-string buf (format "/name %s\n" slug))
+      t)))
 
 ;; ----- Opencode --------------------------------------------------------
 ;;
@@ -2880,6 +3012,51 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
 ;; The first line is a session header carrying `id' and `cwd'.  Later
 ;; records of type `message' carry user/assistant turns; `session_info'
 ;; records carry a user-visible session name set via `/name'.
+;;
+;; Important: if several Pi instances are launched in the same project,
+;; each live buffer needs to be matched to a distinct session file.
+;; Matching purely by cwd picks the newest transcript over and over,
+;; which makes TOPIC and ACTIVITY repeat across rows.  The helpers
+;; below assign the newest matching session files in launch order.
+
+(defun llm-dashboard--pi-session-candidates ()
+  "Return Pi session metadata candidates, newest first."
+  (let (acc)
+    (dolist (path (llm-dashboard--pi-session-files 64))
+      (let* ((header (llm-dashboard--pi-read-header path))
+             (sid (alist-get 'id header))
+             (cwd (alist-get 'cwd header))
+             (mtime (file-attribute-modification-time
+                     (file-attributes path))))
+        (when (and sid cwd)
+          (push (list :sid sid
+                      :cwd (file-name-as-directory cwd)
+                      :mtime mtime
+                      :path path)
+                acc))))
+    (sort acc
+          (lambda (a b)
+            (time-less-p (plist-get b :mtime)
+                         (plist-get a :mtime))))))
+
+(defun llm-dashboard--pi-live-instances-for-cwd (cwd)
+  "Return live Pi instances rooted at CWD, oldest first."
+  (let ((target (directory-file-name cwd)))
+    (sort (cl-remove-if-not
+           (lambda (other)
+             (and (eq (llm-dashboard--instance-backend other) 'pi)
+                  (equal (directory-file-name
+                          (llm-dashboard-instance-cwd other))
+                         target)))
+           (llm-dashboard--instances-list))
+          (lambda (a b)
+            (let ((ta (or (llm-dashboard-instance-started-at a) 0))
+                  (tb (or (llm-dashboard-instance-started-at b) 0)))
+              (or (< ta tb)
+                  (and (= ta tb)
+                       (string-lessp (buffer-name (llm-dashboard-instance-buffer a))
+                                     (buffer-name (llm-dashboard-instance-buffer b))))))))))
+
 
 (defun llm-dashboard--pi-state-dir ()
   "Resolve Pi's state directory."
@@ -2932,22 +3109,32 @@ When MAX-FILES is non-nil, return only that many entries."
         (mapconcat #'identity texts "\n\n"))))))
 
 (defun llm-dashboard--pi-session-id-fn (inst)
-  "Pi `:session-id-fn' — newest session whose header cwd = INST cwd."
+  "Pi `:session-id-fn' — assign distinct session files to same-cwd instances."
   (let* ((target (directory-file-name (llm-dashboard-instance-cwd inst)))
-         (started (or (llm-dashboard-instance-started-at inst) 0)))
-    (cl-some
-     (lambda (path)
-       (let* ((mtime (float-time
-                      (file-attribute-modification-time
-                       (file-attributes path))))
-              (header (llm-dashboard--pi-read-header path))
-              (cwd (alist-get 'cwd header))
-              (sid (alist-get 'id header)))
-         (when (and cwd sid
-                    (>= mtime (- started 5.0))
-                    (equal (directory-file-name cwd) target))
-           sid)))
-     (llm-dashboard--pi-session-files 64))))
+         (started (or (llm-dashboard-instance-started-at inst) 0))
+         (live (llm-dashboard--pi-live-instances-for-cwd target))
+         (live-index (cl-position inst live :test #'eq))
+         (candidates
+          (seq-filter
+           (lambda (cand)
+             (let ((cwd (plist-get cand :cwd))
+                   (mtime (plist-get cand :mtime)))
+               (and cwd mtime
+                    (equal (directory-file-name cwd) target)
+                    (>= (float-time mtime) (- started 5.0)))))
+           (llm-dashboard--pi-session-candidates)))
+         (usable (sort candidates
+                       (lambda (a b)
+                         (time-less-p (plist-get a :mtime)
+                                      (plist-get b :mtime)))))
+         (n (min (length live) (length usable)))
+         (relevant (if (> n 0) (last usable n) usable))
+         (chosen (and live-index
+                      (or (nth live-index relevant)
+                          (nth live-index usable)
+                          (car (last usable)))))
+         (sid (plist-get chosen :sid)))
+    sid))
 
 (defun llm-dashboard--pi-transcript-path-fn (_cwd sid)
   "Pi `:transcript-path-fn' — find the session JSONL for SID."
@@ -3048,13 +3235,16 @@ When MAX-FILES is non-nil, return only that many entries."
                 acc))))
     (nreverse acc)))
 
-(defun llm-dashboard--pi-rename-fn (proc slug)
+(defun llm-dashboard--pi-rename-fn (inst slug)
   "Pi `:rename-fn' — `/name SLUG' via the split-write rule."
-  (when (and proc (process-live-p proc) slug (not (string-empty-p slug)))
-    (process-send-string proc (format "/name %s" slug))
-    (sit-for 0.05)
-    (process-send-string proc "\r")
-    t))
+  (let ((proc (and inst (llm-dashboard--instance-process inst)))
+        (buf (and inst (llm-dashboard-instance-buffer inst))))
+    (when (and proc (process-live-p proc) (buffer-live-p buf)
+               slug (not (string-empty-p slug)))
+      (llm-dashboard--terminal-send-string buf (format "/name %s" slug))
+      (sit-for 0.05)
+      (llm-dashboard--terminal-send-string buf "\r")
+      t)))
 
 ;; ----- Codex -----------------------------------------------------------
 ;;
@@ -3247,16 +3437,19 @@ user/assistant and a content[0].text field are emitted."
                 acc))))
     (nreverse acc)))
 
-(defun llm-dashboard--codex-rename-fn (proc slug)
+(defun llm-dashboard--codex-rename-fn (inst slug)
   "Codex `:rename-fn' — `/rename SLUG' via the split-write rule.
 TUI input lines occasionally drop their CR if the body + newline
 arrive in the same write; sending the body, sitting for 50ms, and
 then writing a lone `\\r' reliably lands the command."
-  (when (and proc (process-live-p proc) slug (not (string-empty-p slug)))
-    (process-send-string proc (format "/rename %s" slug))
-    (sit-for 0.05)
-    (process-send-string proc "\r")
-    t))
+  (let ((proc (and inst (llm-dashboard--instance-process inst)))
+        (buf (and inst (llm-dashboard-instance-buffer inst))))
+    (when (and proc (process-live-p proc) (buffer-live-p buf)
+               slug (not (string-empty-p slug)))
+      (llm-dashboard--terminal-send-string buf (format "/rename %s" slug))
+      (sit-for 0.05)
+      (llm-dashboard--terminal-send-string buf "\r")
+      t)))
 
 ;;; --- Transitional compat aliases -----------------------------------------
 ;;

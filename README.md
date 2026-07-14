@@ -87,11 +87,20 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `g`   | refresh                                                |
 | `?`   | transient menu                                         |
 
-In a managed `eat` buffer, `C-c C-i` sends the backend's in-band interrupt
+In a managed terminal buffer, `C-c C-i` sends the backend's in-band interrupt
 key to the current agent.
 
 `M-x llm-dashboard-interrupt-instance` also works directly from a managed
-`eat` buffer, not just from the dashboard.
+terminal buffer, not just from the dashboard.
+
+To add your own terminal-buffer bindings, customize
+`llm-dashboard-managed-terminal-mode-map`, for example:
+
+```elisp
+(with-eval-after-load 'llm-dashboard
+  (define-key llm-dashboard-managed-terminal-mode-map
+              (kbd "M-<up>") #'my-command))
+```
 
 `r` (restart) is **not** bound by default — restart spawns a fresh agent
 without a session resume, dropping the conversation, and a single-letter
@@ -241,4 +250,9 @@ every session recorded in the manifest.
 
 ;; Auto-naming
 (setq llm-dashboard-auto-name-after-turns 5)      ;; nil disables
+
+;; Custom keys in managed terminal buffers launched by llm-dashboard
+(with-eval-after-load 'llm-dashboard
+  (define-key llm-dashboard-managed-terminal-mode-map
+              (kbd "M-<up>") #'my-command))
 ```
