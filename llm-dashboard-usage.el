@@ -6,7 +6,7 @@
 
 ;;; Commentary:
 ;;
-;; Scans each live claude instance's eat buffer for the TUI's
+;; Scans each live claude instance's terminal buffer for the TUI's
 ;; usage-limit warnings (5-hour session, weekly, Opus, Sonnet, overage)
 ;; and reacts according to `llm-dashboard-usage-mode':
 ;;

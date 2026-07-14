@@ -10,12 +10,13 @@
 ;; pending action:
 ;;
 ;;   1. Scheduled SEND  — queue (instance, message, time).  At fire
-;;      time, deliver MESSAGE to the live INSTANCE via its eat PTY.
+;;      time, deliver MESSAGE to the live INSTANCE via its managed
+;;      terminal buffer.
 ;;
 ;;   2. Scheduled LAUNCH — queue (cwd, extra-args, optional initial
 ;;      message, time).  At fire time, run claude in CWD (cold launch,
 ;;      `--resume <sid>', or fresh worktree) and optionally seed it
-;;      with an initial prompt once the new eat process is settled.
+;;      with an initial prompt once the new terminal process is settled.
 ;;
 ;; Both kinds persist across emacs restarts.  Sends live in
 ;; `llm-dashboard-pending-sends-file', launches in
@@ -338,21 +339,23 @@ same instance at fire time."
           ;; choice 5 turns later.
           (when-let ((rn (llm-dashboard-pending-send-rename-name p)))
             (when (and (stringp rn) (not (string-empty-p (string-trim rn))))
-              (llm-dashboard--inject-rename proc rn)
+              (llm-dashboard--inject-rename inst rn)
               (when (boundp 'llm-dashboard--name-injected)
                 (puthash (llm-dashboard-instance-buffer inst)
                          t llm-dashboard--name-injected))))
-          (process-send-string
-           proc (llm-dashboard-pending-send-message p))
+          (llm-dashboard--terminal-send-string
+           (llm-dashboard-instance-buffer inst)
+           (llm-dashboard-pending-send-message p))
           (sit-for 0.05)
-          (process-send-string proc "\r")
+          (llm-dashboard--terminal-send-string
+           (llm-dashboard-instance-buffer inst) "\r")
           (remhash id llm-dashboard--pending-sends)
           (llm-dashboard--write-pending-sends)
           (message "llm-dashboard: delivered scheduled send to %s"
                    (buffer-name (llm-dashboard-instance-buffer inst)))))))))
 
-(defun llm-dashboard--inject-rename (proc rename-name)
-  "Send `/rename RENAME-NAME' through PROC and submit.
+(defun llm-dashboard--inject-rename (inst rename-name)
+  "Send `/rename RENAME-NAME' through INST's terminal and submit.
 
 Defends against Claude's slash-command picker / autocomplete:
 
@@ -368,15 +371,17 @@ Defends against Claude's slash-command picker / autocomplete:
   - A 0.5s wait at the end gives the rename time to land in the
     PID-json `name' field so subsequent reads of the live name see
     the new value."
-  (when (and proc (process-live-p proc))
-    (process-send-string proc "\e")          ; dismiss picker / autocomplete
-    (sit-for 0.1)
-    (process-send-string proc "\C-u")        ; clear input line
-    (sit-for 0.05)
-    (process-send-string proc (format "/rename %s" rename-name))
-    (sit-for 0.05)
-    (process-send-string proc "\r")          ; submit
-    (sit-for 0.5)))                          ; let the rename land
+  (let ((proc (and inst (llm-dashboard--instance-process inst)))
+        (buf (and inst (llm-dashboard-instance-buffer inst))))
+    (when (and proc (process-live-p proc) (buffer-live-p buf))
+      (llm-dashboard--terminal-send-string buf "\e")          ; dismiss picker / autocomplete
+      (sit-for 0.1)
+      (llm-dashboard--terminal-send-string buf "\C-u")        ; clear input line
+      (sit-for 0.05)
+      (llm-dashboard--terminal-send-string buf (format "/rename %s" rename-name))
+      (sit-for 0.05)
+      (llm-dashboard--terminal-send-string buf "\r")          ; submit
+      (sit-for 0.5))))                         ; let the rename land
 
 ;;; --- Delivery: launches ---------------------------------------------------
 
