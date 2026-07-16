@@ -420,6 +420,12 @@ terminal, for example:
   (define-key llm-dashboard-managed-terminal-mode-map
               (kbd \"M-<up>\") (function my-command))")
 
+;; Keep the normal Emacs recenter behavior.  Sending C-l to a full-screen
+;; agent makes it repaint the entire TUI, which can briefly stall Ghostel.
+;; Define this outside the `defvar' so reloading updates the live keymap.
+(define-key llm-dashboard-managed-terminal-mode-map
+            (kbd "C-l") #'recenter-top-bottom)
+
 (define-minor-mode llm-dashboard-managed-terminal-mode
   "Minor mode active in llm-dashboard-managed terminal buffers.
 
@@ -1555,6 +1561,9 @@ BACKEND defaults to the currently-active `llm-dashboard-backend'."
   (when-let ((inst (gethash (current-buffer) llm-dashboard--instances))
              (sid (llm-dashboard-instance-session-id inst)))
     (remhash sid llm-dashboard--kind-cache))
+  (when (boundp 'llm-dashboard--pi-unresolved-directory-mtimes)
+    (remhash (current-buffer)
+             llm-dashboard--pi-unresolved-directory-mtimes))
   (remhash (current-buffer) llm-dashboard--instances)
   (llm-dashboard--write-manifest)
   (llm-dashboard--maybe-refresh))
@@ -3019,18 +3028,70 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
 ;; which makes TOPIC and ACTIVITY repeat across rows.  The helpers
 ;; below assign the newest matching session files in launch order.
 
-(defun llm-dashboard--pi-session-candidates ()
-  "Return Pi session metadata candidates, newest first."
+(defvar llm-dashboard--pi-transcript-path-cache
+  (make-hash-table :test 'equal)
+  "Map active Pi session IDs to cached transcript metadata.
+Each value is `(:path PATH :directory-mtime MTIME)'.  The directory
+mtime changes when Pi creates a session, invalidating cached identity
+without rescanning unrelated projects on every dashboard refresh.")
+
+(defvar llm-dashboard--pi-unresolved-directory-mtimes
+  (make-hash-table :test 'eq)
+  "Map live Pi buffers without transcripts to their directory mtime.
+Pi does not create a session JSONL until it has something to persist.
+Remembering the negative lookup prevents every dashboard cell from
+rescanning the same CWD; creation of the JSONL changes the directory
+mtime and automatically retries discovery.")
+
+(defun llm-dashboard--pi-session-directory (cwd)
+  "Return Pi's per-project session directory for CWD.
+Pi encodes an absolute CWD as `--<path>--', removing one leading
+separator and replacing `/`, `\\`, and `:' with `-'."
+  (let* ((resolved (directory-file-name (expand-file-name cwd)))
+         (without-root
+          (replace-regexp-in-string "\\`[/\\\\]" "" resolved))
+         (safe (replace-regexp-in-string "[/\\\\:]" "-" without-root)))
+    (expand-file-name
+     (format "--%s--" safe)
+     (expand-file-name "sessions" (llm-dashboard--pi-state-dir)))))
+
+(defun llm-dashboard--pi-session-directory-mtime (cwd)
+  "Return the modification time of Pi's session directory for CWD."
+  (when-let* ((attrs (file-attributes
+                      (llm-dashboard--pi-session-directory cwd))))
+    (file-attribute-modification-time attrs)))
+
+(defun llm-dashboard--pi-cache-transcript-path (cwd sid path)
+  "Cache PATH as the active Pi transcript for SID rooted at CWD."
+  (when (and cwd sid path)
+    (puthash sid
+             (list :path path
+                   :directory-mtime
+                   (llm-dashboard--pi-session-directory-mtime cwd))
+             llm-dashboard--pi-transcript-path-cache))
+  path)
+
+(defun llm-dashboard--pi-session-candidates (&optional cwd)
+  "Return Pi session metadata candidates, newest first.
+When CWD is non-nil, inspect only that project's session directory.
+The active-session path always supplies CWD; a global walk is reserved
+for the explicit past-session browser."
   (let (acc)
-    (dolist (path (llm-dashboard--pi-session-files 64))
-      (let* ((header (llm-dashboard--pi-read-header path))
-             (sid (alist-get 'id header))
-             (cwd (alist-get 'cwd header))
-             (mtime (file-attribute-modification-time
-                     (file-attributes path))))
-        (when (and sid cwd)
+    (dolist (path (llm-dashboard--pi-session-files 64 cwd))
+      (let* ((header (unless cwd (llm-dashboard--pi-read-header path)))
+             ;; Pi filenames are <timestamp>_<session-id>.jsonl, so an
+             ;; active CWD scan need not open every candidate's header.
+             (sid (or (and (string-match
+                            "_\\([^_]+\\)\\.jsonl\\'" path)
+                           (match-string 1 path))
+                      (alist-get 'id header)))
+             (session-cwd (or cwd (alist-get 'cwd header)))
+             (attrs (file-attributes path))
+             (mtime (and attrs
+                         (file-attribute-modification-time attrs))))
+        (when (and sid session-cwd mtime)
           (push (list :sid sid
-                      :cwd (file-name-as-directory cwd)
+                      :cwd (file-name-as-directory session-cwd)
                       :mtime mtime
                       :path path)
                 acc))))
@@ -3063,19 +3124,37 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
   (or llm-dashboard-claude-dir
       (llm-dashboard--backend-prop :state-dir 'pi)))
 
-(defun llm-dashboard--pi-session-files (&optional max-files)
+(defun llm-dashboard--pi-session-files (&optional max-files cwd)
   "Return Pi session JSONL paths, newest first.
-When MAX-FILES is non-nil, return only that many entries."
+When MAX-FILES is non-nil, return only that many entries.  When CWD
+is non-nil, inspect only Pi's directory for that project; only callers
+that explicitly enumerate past sessions should leave CWD nil."
   (let* ((sessions (expand-file-name "sessions"
                                      (llm-dashboard--pi-state-dir)))
-         (files (and (file-directory-p sessions)
-                     (directory-files-recursively sessions "\\.jsonl\\'" t))))
+         (search-root (if cwd
+                          (llm-dashboard--pi-session-directory cwd)
+                        sessions))
+         (files
+          (and (file-directory-p search-root)
+               (if cwd
+                   (directory-files search-root t "\\.jsonl\\'" t)
+                 (directory-files-recursively
+                  search-root "\\.jsonl\\'" t))))
+         ;; Decorate once before sorting.  Calling `file-attributes' inside
+         ;; the comparator stats the same files O(n log n) times and was the
+         ;; main source of multi-second dashboard stalls.
+         (ranked
+          (delq nil
+                (mapcar
+                 (lambda (path)
+                   (when-let ((attrs (file-attributes path)))
+                     (cons (file-attribute-modification-time attrs) path)))
+                 files))))
     (setq files
-          (sort files
-                (lambda (a b)
-                  (time-less-p
-                   (file-attribute-modification-time (file-attributes b))
-                   (file-attribute-modification-time (file-attributes a))))))
+          (mapcar #'cdr
+                  (sort ranked
+                        (lambda (a b)
+                          (time-less-p (car b) (car a))))))
     (if max-files (seq-take files max-files) files)))
 
 (defun llm-dashboard--pi-read-header (path)
@@ -3109,47 +3188,106 @@ When MAX-FILES is non-nil, return only that many entries."
         (mapconcat #'identity texts "\n\n"))))))
 
 (defun llm-dashboard--pi-session-id-fn (inst)
-  "Pi `:session-id-fn' — assign distinct session files to same-cwd instances."
+  "Pi `:session-id-fn' — resolve INST without scanning unrelated projects.
+A uniquely-owned cached transcript is reused while its per-CWD directory
+mtime is unchanged.  Creating a new Pi session changes that mtime and
+causes one small rescan of this instance's project directory."
   (let* ((target (directory-file-name (llm-dashboard-instance-cwd inst)))
-         (started (or (llm-dashboard-instance-started-at inst) 0))
          (live (llm-dashboard--pi-live-instances-for-cwd target))
-         (live-index (cl-position inst live :test #'eq))
-         (candidates
-          (seq-filter
-           (lambda (cand)
-             (let ((cwd (plist-get cand :cwd))
-                   (mtime (plist-get cand :mtime)))
-               (and cwd mtime
-                    (equal (directory-file-name cwd) target)
-                    (>= (float-time mtime) (- started 5.0)))))
-           (llm-dashboard--pi-session-candidates)))
-         (usable (sort candidates
-                       (lambda (a b)
-                         (time-less-p (plist-get a :mtime)
-                                      (plist-get b :mtime)))))
-         (n (min (length live) (length usable)))
-         (relevant (if (> n 0) (last usable n) usable))
-         (chosen (and live-index
-                      (or (nth live-index relevant)
-                          (nth live-index usable)
-                          (car (last usable)))))
-         (sid (plist-get chosen :sid)))
-    sid))
+         (cached-sid (llm-dashboard-instance-session-id inst))
+         (cached-owner-count
+          (and cached-sid
+               (cl-count cached-sid live :test #'equal
+                         :key #'llm-dashboard-instance-session-id)))
+         (cached-path (and cached-sid
+                           (llm-dashboard--pi-transcript-path-fn
+                            target cached-sid)))
+         (cached (and cached-sid
+                      (gethash cached-sid
+                               llm-dashboard--pi-transcript-path-cache)))
+         (directory-mtime (llm-dashboard--pi-session-directory-mtime target))
+         (buf (llm-dashboard-instance-buffer inst))
+         (no-session-yet
+          (gethash buf llm-dashboard--pi-unresolved-directory-mtimes
+                   :llm-dashboard-not-cached)))
+    (cond
+     ((and cached-sid cached-path (= cached-owner-count 1)
+           (equal directory-mtime
+                  (plist-get cached :directory-mtime)))
+      cached-sid)
+     ((and (null cached-sid)
+           (not (eq no-session-yet :llm-dashboard-not-cached))
+           (equal no-session-yet directory-mtime))
+      nil)
+     (t
+      (let* ((live-index (cl-position inst live :test #'eq))
+             ;; Match all same-CWD instances against one common candidate
+             ;; window, then assign oldest-to-oldest.  Filtering by each
+             ;; individual instance's start time made the second live buffer
+             ;; reuse the first buffer's SID before its own transcript existed.
+             (oldest-start
+              (if live
+                  (apply #'min
+                         (mapcar (lambda (other)
+                                   (or (llm-dashboard-instance-started-at other)
+                                       0))
+                                 live))
+                0))
+             (candidates
+              (seq-filter
+               (lambda (cand)
+                 (let ((candidate-cwd (plist-get cand :cwd))
+                       (mtime (plist-get cand :mtime)))
+                   (and candidate-cwd mtime
+                        (equal (directory-file-name candidate-cwd) target)
+                        (>= (float-time mtime) (- oldest-start 5.0)))))
+               (llm-dashboard--pi-session-candidates target)))
+             (usable (sort candidates
+                           (lambda (a b)
+                             (time-less-p (plist-get a :mtime)
+                                          (plist-get b :mtime)))))
+             (n (min (length live) (length usable)))
+             (relevant (if (> n 0) (last usable n) usable))
+             ;; No fallback: a fresh Pi buffer has no session file until its
+             ;; first persisted interaction and must not borrow a sibling SID.
+             (chosen (and live-index (nth live-index relevant)))
+             (sid (plist-get chosen :sid))
+             (path (plist-get chosen :path)))
+        (if (and sid path)
+            (progn
+              (remhash buf llm-dashboard--pi-unresolved-directory-mtimes)
+              (llm-dashboard--pi-cache-transcript-path target sid path))
+          (puthash buf directory-mtime
+                   llm-dashboard--pi-unresolved-directory-mtimes))
+        (when (and cached-sid (null sid) (> cached-owner-count 1))
+          (setf (llm-dashboard-instance-session-id inst) nil))
+        sid)))))
 
-(defun llm-dashboard--pi-transcript-path-fn (_cwd sid)
-  "Pi `:transcript-path-fn' — find the session JSONL for SID."
+(defun llm-dashboard--pi-transcript-path-fn (cwd sid)
+  "Pi `:transcript-path-fn' — return the active JSONL for CWD and SID.
+The hot path is a hash lookup.  On a miss, search only CWD's Pi session
+directory and use the session ID embedded in the filename; never walk
+all projects."
   (when sid
-    (cl-some
-     (lambda (path)
-       (let ((header (llm-dashboard--pi-read-header path)))
-         (and (equal (alist-get 'id header) sid) path)))
-     (llm-dashboard--pi-session-files))))
+    (let* ((cached (gethash sid llm-dashboard--pi-transcript-path-cache))
+           (cached-path (plist-get cached :path)))
+      (cond
+       ((and cached-path (file-readable-p cached-path)) cached-path)
+       ((null cwd) nil)
+       (t
+        (let* ((dir (llm-dashboard--pi-session-directory cwd))
+               (regexp (format "_%s\\.jsonl\\'" (regexp-quote sid)))
+               (path (and (file-directory-p dir)
+                          (car (directory-files dir t regexp t)))))
+          (when path
+            (llm-dashboard--pi-cache-transcript-path cwd sid path))))))))
 
 (defun llm-dashboard--pi-session-name-fn (inst)
   "Pi `:session-name-fn' — latest `session_info.name' for INST, if any."
   (when-let* ((sid (or (llm-dashboard--live-session-id inst)
                        (llm-dashboard-instance-session-id inst)))
-              (path (llm-dashboard--pi-transcript-path-fn nil sid)))
+              (path (llm-dashboard--pi-transcript-path-fn
+                     (llm-dashboard-instance-cwd inst) sid)))
     (let (name)
       (with-temp-buffer
         (insert-file-contents path)
