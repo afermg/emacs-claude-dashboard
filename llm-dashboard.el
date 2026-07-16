@@ -3349,7 +3349,9 @@ all projects."
     (nreverse msgs)))
 
 (defun llm-dashboard--pi-list-sessions-fn ()
-  "Pi `:list-sessions-fn' — every session JSONL, newest first."
+  "Pi `:list-sessions-fn' — every session JSONL, newest first.
+Read only each transcript's head for its first prompt; fully walking every
+transcript makes the resume picker scale with the entire session history."
   (let (acc)
     (dolist (path (llm-dashboard--pi-session-files))
       (let* ((header (llm-dashboard--pi-read-header path))
@@ -3358,11 +3360,7 @@ all projects."
              (mtime (file-attribute-modification-time
                      (file-attributes path)))
              (first-prompt
-              (when path
-                (when-let ((msg (cl-find-if
-                                 (lambda (m) (eq 'user (alist-get 'role m)))
-                                 (llm-dashboard--pi-transcript-walk-fn path))))
-                  (alist-get 'text msg)))))
+              (cdr (llm-dashboard--read-jsonl-cwd-and-prompt path))))
         (when (and sid cwd)
           (push (make-llm-dashboard-past-session
                  :session-id sid
