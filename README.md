@@ -201,16 +201,22 @@ too often and were removed:
   backend name when available, then the transcript's recorded name,
   then a worktree or prompt-derived slug, with `—` as the last
   resort).
-- `TAB` on a row reveals the last user query (`❯ …`) and the latest
-  assistant response. The full per-query / per-response history is a
-  level deeper — magit's `1`/`2`/`3` (or `M-1`/`M-2`/`M-3` for whole
-  buffer) cycle through the depth.
+- `TAB` on a row reveals recent user queries (`❯ …`); each assistant
+  response is a level deeper. Magit's `1`/`2`/`3` (or
+  `M-1`/`M-2`/`M-3` for the whole buffer) cycle through the depth. The
+  dashboard renders only the most recent 20 exchanges by default so
+  refresh cost stays bounded; the backend transcript remains complete.
 
 ### Refresh + caching
 
 - A 5-second timer re-renders the dashboard whenever it's visible.
+- Terminal launches and buffer-selection hooks queue one coalesced redraw
+  after the current command, so switching buffers is not blocked by render work.
 - Expensive lookups (branch name, project name, topic) are cached for
   30 s per instance.
+- Active Pi transcripts are parsed incrementally. Once a JSONL file has been
+  seen, refreshes read only bytes appended since the previous pass instead of
+  reparsing the full conversation.
 
 ### Process lifecycle
 
@@ -225,6 +231,35 @@ transcripts live at `<state-dir>/projects/<slug>/<sid>.jsonl` (for
 Claude: `~/.claude/projects/…`) and `claude --resume <sid>` works on
 a fresh launch.  Use `M-x llm-dashboard-resume-all` to relaunch
 every session recorded in the manifest.
+
+## Potential issues
+
+### Repeated `llm-dashboard--on-window-size-change` errors on Emacs 30+
+
+If `*Messages*` contains entries like:
+
+```text
+Error muted by safe_call: (llm-dashboard--on-window-size-change #<window ... on *LLM Dashboard*>) signaled (error "Window is on a different frame")
+```
+
+then a buffer-local `window-size-change-functions` callback is being
+called with a **window**, not a frame.  Emacs calls default/global entries
+in that hook with a frame argument, but buffer-local entries with the
+changed window.  A handler that assumes it always receives a frame can
+spam errors during frame resizes, focus changes, or dashboard refreshes;
+with `debug-on-error` enabled this can drop Emacs into the debugger and
+make a client frame feel stuck.
+
+The fix is for the callback to accept both a frame and a window, processing
+`(list window)` for the buffer-local case and `(window-list frame ...)` for
+the global case.  As a temporary workaround, remove the buffer-local hook
+from the dashboard buffer:
+
+```elisp
+(with-current-buffer "*LLM Dashboard*"
+  (remove-hook 'window-size-change-functions
+               #'llm-dashboard--on-window-size-change t))
+```
 
 ## Customization
 
@@ -245,6 +280,7 @@ every session recorded in the manifest.
 ;; Refresh + classifier (nil spinner-regexp = backend default)
 (setq llm-dashboard-refresh-interval 5
       llm-dashboard-cache-ttl 30
+      llm-dashboard-overview-max-exchanges 20     ;; nil = full history
       llm-dashboard-tail-chars 2000
       llm-dashboard-spinner-regexp nil)
 

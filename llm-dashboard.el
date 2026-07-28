@@ -256,6 +256,19 @@ be resolved or the backend has no walker."
      :transcript-walk-fn (llm-dashboard--instance-backend inst)
      path)))
 
+(defun llm-dashboard--inst-walk-messages-reverse (inst &optional sid)
+  "Return INST's normalized messages newest first.
+Pi maintains this ordering incrementally.  Other backends reverse a fresh
+chronological walk because their transcript readers do not cache shared lists."
+  (when-let* ((path (llm-dashboard--inst-transcript-path inst sid)))
+    (let ((backend (llm-dashboard--instance-backend inst)))
+      (if (and (eq backend 'pi)
+               (fboundp 'llm-dashboard--pi-transcript-walk-reverse-fn))
+          (llm-dashboard--pi-transcript-walk-reverse-fn path)
+        (when-let ((messages (llm-dashboard--backend-call
+                              :transcript-walk-fn backend path)))
+          (nreverse messages))))))
+
 (defcustom llm-dashboard-program nil
   "Executable used to launch a backend instance.
 When nil (the default) the program name is taken from the active
@@ -288,6 +301,15 @@ this defcustom.  Set explicitly to override per-Emacs-session."
 (defcustom llm-dashboard-cache-ttl 30
   "Seconds to cache git branch and last-prompt lookups per instance."
   :type 'number)
+
+(defcustom llm-dashboard-overview-max-exchanges 20
+  "Maximum recent exchanges rendered under each dashboard row.
+Older exchanges remain in the backend transcript and are available when
+resuming the session, but are omitted from the frequently-redrawn dashboard.
+Set this to nil to render the complete conversation history."
+  :type '(choice (const :tag "All exchanges" nil)
+                 (integer :tag "Recent exchanges"))
+  :group 'llm-dashboard)
 
 (defcustom llm-dashboard-claude-dir nil
   "Override for the backend's per-user state directory.
@@ -1215,12 +1237,12 @@ exists yet."
               t))
         ;; Generic path for non-Claude backends: first sentence of the
         ;; latest assistant message from the normalized walker.
-        (when-let* ((msgs (llm-dashboard--inst-walk-messages inst))
+        (when-let* ((msgs (llm-dashboard--inst-walk-messages-reverse inst))
                     (last-asst (cl-some
                                 (lambda (m)
                                   (and (eq (alist-get 'role m) 'assistant)
                                        (alist-get 'text m)))
-                                (reverse msgs))))
+                                msgs)))
           (llm-dashboard--first-sentence last-asst))
         "—")))
 
@@ -1256,6 +1278,38 @@ messages are concatenated with a blank line into its :asst."
                                new))))))))
     (when current (push current exchanges))
     (nreverse exchanges)))
+
+(defun llm-dashboard--recent-exchanges (inst max-exchanges)
+  "Return at most MAX-EXCHANGES from INST, in chronological order.
+The scan starts at the newest normalized message and stops after enough user
+turns, so Pi dashboard redraw cost does not grow with the full conversation."
+  (let ((messages (llm-dashboard--inst-walk-messages-reverse inst))
+        pending-assistant exchanges
+        (user-count 0))
+    (while (and messages (< user-count max-exchanges))
+      (let* ((m (pop messages))
+             (role (alist-get 'role m))
+             (txt (alist-get 'text m))
+             (raw (alist-get 'raw m))
+             (pid (and (listp raw) (alist-get 'promptId raw))))
+        (cond
+         ((and (eq role 'user) txt
+               (not (string-prefix-p "<" txt))
+               (> (length (string-trim txt)) 0))
+          (push (list :user (string-trim txt)
+                      :asst (and pending-assistant
+                                 (mapconcat #'identity
+                                            pending-assistant "\n\n"))
+                      :id (or pid (md5 txt)))
+                exchanges)
+          (setq pending-assistant nil
+                user-count (1+ user-count)))
+         ((and (eq role 'assistant) txt
+               (> (length (string-trim txt)) 0))
+          ;; Messages arrive newest-first here; pushing restores the original
+          ;; order before they are joined for their preceding user turn.
+          (push (string-trim txt) pending-assistant)))))
+    exchanges))
 
 (defun llm-dashboard--last-exchange (cwd sid)
   "Return (:user STR :asst STR) — the latest user query and assistant text.
@@ -1558,9 +1612,17 @@ BACKEND defaults to the currently-active `llm-dashboard-backend'."
     inst))
 
 (defun llm-dashboard--on-buffer-killed ()
-  (when-let ((inst (gethash (current-buffer) llm-dashboard--instances))
-             (sid (llm-dashboard-instance-session-id inst)))
-    (remhash sid llm-dashboard--kind-cache))
+  (when-let ((inst (gethash (current-buffer) llm-dashboard--instances)))
+    (when-let ((sid (llm-dashboard-instance-session-id inst)))
+      (remhash sid llm-dashboard--kind-cache)
+      (when (and (eq (llm-dashboard--instance-backend inst) 'pi)
+                 (boundp 'llm-dashboard--pi-transcript-path-cache))
+        (when-let* ((metadata (gethash
+                               sid llm-dashboard--pi-transcript-path-cache))
+                    (path (plist-get metadata :path)))
+          (when (boundp 'llm-dashboard--pi-transcript-content-cache)
+            (remhash path llm-dashboard--pi-transcript-content-cache)))
+        (remhash sid llm-dashboard--pi-transcript-path-cache))))
   (when (boundp 'llm-dashboard--pi-unresolved-directory-mtimes)
     (remhash (current-buffer)
              llm-dashboard--pi-unresolved-directory-mtimes))
@@ -1671,15 +1733,17 @@ weeks ago doesn't surprise you."
       (message "llm-dashboard: resumed %d session(s)" (length candidates))))))
 
 (defun llm-dashboard--launch (cwd extra-args)
-  "Launch the active backend in CWD with EXTRA-ARGS, register, refresh, pop."
+  "Launch the active backend in CWD with EXTRA-ARGS, register, pop, and refresh."
   (let* ((name (llm-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (program (llm-dashboard--program))
          (args (append llm-dashboard-program-args extra-args)))
     (llm-dashboard--launch-terminal buf name cwd program args)
     (llm-dashboard--register buf cwd)
-    (llm-dashboard--maybe-refresh)
     (pop-to-buffer buf llm-dashboard-instance-window-action)
+    ;; Let the terminal appear before rebuilding a visible dashboard.  The
+    ;; buffer-switch hooks coalesce with this request onto the same idle timer.
+    (llm-dashboard--queue-refresh)
     buf))
 
 ;;;###autoload
@@ -2355,16 +2419,28 @@ to reveal responses."
       (magit-section-hide section))))
 
 (defun llm-dashboard--insert-instance-overview (inst)
-  "Insert the per-instance overview body (visible when row unfolds).
-Each user query becomes its own foldable subsection whose body is
-the formatted assistant response.  Combined with magit-section's
-`magit-section-show-level-N-all' bindings on `1'..`4', this gives
-three progressive views: rows-only (1), rows + queries (2), rows
-+ queries + responses (3)."
-  (let* ((exchanges (llm-dashboard--all-exchanges inst)))
+  "Insert the bounded per-instance overview body when a row unfolds.
+Each recent user query becomes a foldable subsection whose body is the
+formatted assistant response.  `llm-dashboard-overview-max-exchanges'
+keeps routine redraw time independent of a session's total age."
+  (let* ((limit (and (integerp llm-dashboard-overview-max-exchanges)
+                     (> llm-dashboard-overview-max-exchanges 0)
+                     llm-dashboard-overview-max-exchanges))
+         ;; Read one extra recent exchange to tell whether the visible window
+         ;; is truncated without counting every historical user turn.
+         (candidates (if limit
+                         (llm-dashboard--recent-exchanges inst (1+ limit))
+                       (llm-dashboard--all-exchanges inst)))
+         (omitted (and limit (> (length candidates) limit)))
+         (exchanges (if omitted (last candidates limit) candidates)))
     (if exchanges
-        (dolist (xch exchanges)
-          (llm-dashboard--insert-query-section xch))
+        (progn
+          (when omitted
+            (insert "    "
+                    (propertize "(earlier exchanges omitted)" 'face 'shadow)
+                    "\n"))
+          (dolist (xch exchanges)
+            (llm-dashboard--insert-query-section xch)))
       (insert "    "
               (propertize "(no exchange yet)" 'face 'shadow)
               "\n"))))
@@ -2633,6 +2709,21 @@ side window survives both commands."
                (get-buffer-window buf 'visible))
       (llm-dashboard--maybe-refresh))))
 
+(defvar llm-dashboard--queued-refresh-timer nil
+  "Idle timer used to coalesce dashboard refresh requests from UI hooks.")
+
+(defun llm-dashboard--run-queued-refresh ()
+  "Run a coalesced dashboard refresh after the current command returns."
+  (setq llm-dashboard--queued-refresh-timer nil)
+  (llm-dashboard--refresh-if-visible))
+
+(defun llm-dashboard--queue-refresh ()
+  "Queue one dashboard refresh for the next idle period."
+  (unless (timerp llm-dashboard--queued-refresh-timer)
+    (setq llm-dashboard--queued-refresh-timer
+          (run-with-idle-timer 0 nil
+                               #'llm-dashboard--run-queued-refresh))))
+
 (defvar llm-dashboard--last-selected-instance-buffer nil
   "Most recent managed terminal buffer that triggered a dashboard refresh.
 Used to avoid redundant refreshes when buffer-selection hooks fire
@@ -2650,7 +2741,7 @@ so the visible layout reflows immediately."
                (gethash buf llm-dashboard--instances)
                (not (eq buf llm-dashboard--last-selected-instance-buffer)))
       (setq llm-dashboard--last-selected-instance-buffer buf)
-      (llm-dashboard--refresh-if-visible))))
+      (llm-dashboard--queue-refresh))))
 
 (add-hook 'buffer-list-update-hook #'llm-dashboard--refresh-on-buffer-switch)
 (add-hook 'window-selection-change-functions
@@ -2662,23 +2753,34 @@ so the visible layout reflows immediately."
   "Window text width used for the most recent render of this buffer.
 Tracked per-buffer so the resize hook can no-op when nothing changed.")
 
-(defun llm-dashboard--on-window-size-change (frame)
-  "Re-render the dashboard when its window's text width changes on FRAME.
+(defun llm-dashboard--on-window-size-change (frame-or-window)
+  "Re-render the dashboard when its window's text width changes.
 Hooked into `window-size-change-functions' so the column layout
 adapts when the user moves the frame between monitors of different
-widths, splits the window, or resizes it manually."
-  (dolist (win (window-list frame 'no-mini))
-    (let ((buf (window-buffer win)))
-      (when (and (buffer-live-p buf)
-                 (eq (buffer-local-value 'major-mode buf)
-                     'llm-dashboard-mode))
-        (let ((new-w (window-text-width win))
-              (old-w (buffer-local-value 'llm-dashboard--last-rendered-width
-                                         buf)))
-          (when (and (integerp new-w) (or (null old-w) (/= new-w old-w)))
-            (with-current-buffer buf
-              (setq llm-dashboard--last-rendered-width new-w)
-              (llm-dashboard-refresh))))))))
+widths, splits the window, or resizes it manually.
+
+`window-size-change-functions' calls default/global hook functions
+with a frame argument, but buffer-local hook functions with the
+changed window.  Accept both shapes so the handler works in Emacs 30+
+and when installed globally."
+  (let ((windows (cond
+                  ((windowp frame-or-window)
+                   (and (window-live-p frame-or-window)
+                        (list frame-or-window)))
+                  ((framep frame-or-window)
+                   (window-list frame-or-window 'no-mini)))))
+    (dolist (win windows)
+      (let ((buf (window-buffer win)))
+        (when (and (buffer-live-p buf)
+                   (eq (buffer-local-value 'major-mode buf)
+                       'llm-dashboard-mode))
+          (let ((new-w (window-text-width win))
+                (old-w (buffer-local-value 'llm-dashboard--last-rendered-width
+                                           buf)))
+            (when (and (integerp new-w) (or (null old-w) (/= new-w old-w)))
+              (with-current-buffer buf
+                (setq llm-dashboard--last-rendered-width new-w)
+                (llm-dashboard-refresh)))))))))
 
 (defun llm-dashboard--goto-first-instance ()
   "Move point to the first instance row, or stay at top if none exist."
@@ -3043,6 +3145,17 @@ Remembering the negative lookup prevents every dashboard cell from
 rescanning the same CWD; creation of the JSONL changes the directory
 mtime and automatically retries discovery.")
 
+(cl-defstruct (llm-dashboard--pi-transcript-state
+               (:constructor llm-dashboard--make-pi-transcript-state))
+  "Incrementally parsed state for one append-only Pi transcript."
+  identifier size mtime remainder messages messages-tail messages-reverse name)
+
+(defvar llm-dashboard--pi-transcript-content-cache
+  (make-hash-table :test 'equal)
+  "Map Pi transcript paths to `llm-dashboard--pi-transcript-state' values.
+The cache records the byte offset already consumed, so refreshes parse only
+new JSONL records instead of rereading the complete conversation.")
+
 (defun llm-dashboard--pi-session-directory (cwd)
   "Return Pi's per-project session directory for CWD.
 Pi encodes an absolute CWD as `--<path>--', removing one leading
@@ -3282,71 +3395,129 @@ all projects."
           (when path
             (llm-dashboard--pi-cache-transcript-path cwd sid path))))))))
 
+(defun llm-dashboard--pi-normalize-message-entry (entry)
+  "Return ENTRY as one normalized Pi message, or nil."
+  (let* ((type (alist-get 'type entry))
+         (message (alist-get 'message entry))
+         (role-str (and message (alist-get 'role message)))
+         (role (pcase role-str
+                 ("user" 'user)
+                 ("assistant" 'assistant)
+                 (_ nil)))
+         (text (and (equal type "message")
+                    (llm-dashboard--pi-extract-text
+                     (and message (alist-get 'content message)))))
+         (ts-str (alist-get 'timestamp entry))
+         (ts (and ts-str
+                  (ignore-errors
+                    (float-time (date-to-time ts-str))))))
+    (when (and role text)
+      `((role . ,role)
+        (text . ,text)
+        (ts   . ,ts)
+        (raw  . ,entry)))))
+
+(defun llm-dashboard--pi-cache-entry (state entry)
+  "Fold one parsed Pi transcript ENTRY into STATE."
+  (when-let ((name (and (equal "session_info" (alist-get 'type entry))
+                        (alist-get 'name entry))))
+    (setf (llm-dashboard--pi-transcript-state-name state) name))
+  (when-let ((message (llm-dashboard--pi-normalize-message-entry entry)))
+    (let ((node (list message)))
+      (if-let ((tail (llm-dashboard--pi-transcript-state-messages-tail state)))
+          (setcdr tail node)
+        (setf (llm-dashboard--pi-transcript-state-messages state) node))
+      (setf (llm-dashboard--pi-transcript-state-messages-tail state) node
+            (llm-dashboard--pi-transcript-state-messages-reverse state)
+            (cons message
+                  (llm-dashboard--pi-transcript-state-messages-reverse state))))))
+
+(defun llm-dashboard--pi-parse-appended-region (state)
+  "Parse the current buffer as appended JSONL data into STATE.
+An incomplete final record is retained in STATE and prepended on the next
+read, while malformed complete lines are skipped like the generic walker."
+  (goto-char (point-min))
+  (setf (llm-dashboard--pi-transcript-state-remainder state) nil)
+  (while (< (point) (point-max))
+    (let* ((line-start (point))
+           (line-end (line-end-position))
+           (terminated (< line-end (point-max)))
+           entry)
+      (save-restriction
+        (narrow-to-region line-start line-end)
+        (goto-char (point-min))
+        (setq entry
+              (ignore-errors
+                (json-parse-buffer :object-type 'alist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil))))
+      (cond
+       (entry
+        (llm-dashboard--pi-cache-entry state entry))
+       ((not terminated)
+        (setf (llm-dashboard--pi-transcript-state-remainder state)
+              (buffer-substring-no-properties line-start line-end))))
+      (goto-char (if terminated (1+ line-end) (point-max))))))
+
+(defun llm-dashboard--pi-update-transcript-cache (path)
+  "Return incrementally updated parsed state for Pi transcript PATH.
+Pi appends JSONL records.  A growing file is therefore read from the byte
+size cached on the previous call; truncation, replacement, or same-size
+modification causes a safe full rebuild."
+  (when-let ((attrs (and path (file-attributes path))))
+    (let* ((identifier (file-attribute-file-identifier attrs))
+           (size (file-attribute-size attrs))
+           (mtime (file-attribute-modification-time attrs))
+           (cached (gethash path llm-dashboard--pi-transcript-content-cache))
+           (cached-size (and cached
+                             (llm-dashboard--pi-transcript-state-size cached)))
+           (appendable
+            (and cached
+                 (equal identifier
+                        (llm-dashboard--pi-transcript-state-identifier cached))
+                 (<= cached-size size)
+                 (or (< cached-size size)
+                     (equal mtime
+                            (llm-dashboard--pi-transcript-state-mtime cached)))))
+           (state (if appendable
+                      cached
+                    (llm-dashboard--make-pi-transcript-state
+                     :identifier identifier :size 0 :mtime nil)))
+           (start (llm-dashboard--pi-transcript-state-size state)))
+      (unless (and (= start size)
+                   (equal mtime
+                          (llm-dashboard--pi-transcript-state-mtime state)))
+        (with-temp-buffer
+          (when-let ((remainder
+                      (llm-dashboard--pi-transcript-state-remainder state)))
+            (insert remainder))
+          (insert-file-contents path nil start size)
+          (llm-dashboard--pi-parse-appended-region state))
+        (setf (llm-dashboard--pi-transcript-state-identifier state) identifier
+              (llm-dashboard--pi-transcript-state-size state) size
+              (llm-dashboard--pi-transcript-state-mtime state) mtime)
+        (puthash path state llm-dashboard--pi-transcript-content-cache))
+      state)))
+
 (defun llm-dashboard--pi-session-name-fn (inst)
-  "Pi `:session-name-fn' — latest `session_info.name' for INST, if any."
+  "Pi `:session-name-fn' — latest cached `session_info.name' for INST."
   (when-let* ((sid (or (llm-dashboard--live-session-id inst)
                        (llm-dashboard-instance-session-id inst)))
               (path (llm-dashboard--pi-transcript-path-fn
-                     (llm-dashboard-instance-cwd inst) sid)))
-    (let (name)
-      (with-temp-buffer
-        (insert-file-contents path)
-        (goto-char (point-min))
-        (while (not (eobp))
-          (when (looking-at "{")
-            (let ((entry (ignore-errors
-                           (json-parse-buffer
-                            :object-type 'alist
-                            :array-type 'list
-                            :null-object nil
-                            :false-object nil))))
-              (goto-char (line-beginning-position))
-              (when-let ((n (and entry
-                                 (equal "session_info" (alist-get 'type entry))
-                                 (alist-get 'name entry))))
-                (setq name n))))
-          (forward-line 1)))
-      name)))
+                     (llm-dashboard-instance-cwd inst) sid))
+              (state (llm-dashboard--pi-update-transcript-cache path)))
+    (llm-dashboard--pi-transcript-state-name state)))
 
 (defun llm-dashboard--pi-transcript-walk-fn (path)
-  "Pi `:transcript-walk-fn' — walk session JSONL, normalize messages."
-  (let (msgs)
-    (with-temp-buffer
-      (when (file-readable-p path)
-        (insert-file-contents path)
-        (goto-char (point-min))
-        (while (not (eobp))
-          (when (looking-at "{")
-            (let ((entry (ignore-errors
-                           (json-parse-buffer
-                            :object-type 'alist
-                            :array-type 'list
-                            :null-object nil
-                            :false-object nil))))
-              (goto-char (line-beginning-position))
-              (when entry
-                (let* ((type (alist-get 'type entry))
-                       (message (alist-get 'message entry))
-                       (role-str (and message (alist-get 'role message)))
-                       (role (pcase role-str
-                               ("user" 'user)
-                               ("assistant" 'assistant)
-                               (_ nil)))
-                       (text (and (equal type "message")
-                                  (llm-dashboard--pi-extract-text
-                                   (and message (alist-get 'content message)))))
-                       (ts-str (alist-get 'timestamp entry))
-                       (ts (and ts-str
-                                (ignore-errors
-                                  (float-time (date-to-time ts-str))))))
-                  (when (and role text)
-                    (push `((role . ,role)
-                            (text . ,text)
-                            (ts   . ,ts)
-                            (raw  . ,entry))
-                          msgs))))))
-          (forward-line 1))))
-    (nreverse msgs)))
+  "Return normalized Pi messages, parsing only records appended to PATH."
+  (when-let ((state (llm-dashboard--pi-update-transcript-cache path)))
+    (llm-dashboard--pi-transcript-state-messages state)))
+
+(defun llm-dashboard--pi-transcript-walk-reverse-fn (path)
+  "Return cached normalized Pi messages for PATH, newest first."
+  (when-let ((state (llm-dashboard--pi-update-transcript-cache path)))
+    (llm-dashboard--pi-transcript-state-messages-reverse state)))
 
 (defun llm-dashboard--pi-list-sessions-fn ()
   "Pi `:list-sessions-fn' — every session JSONL, newest first.
