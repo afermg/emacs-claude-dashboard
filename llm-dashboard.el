@@ -2,7 +2,7 @@
 
 ;; Author: Alán F. Muñoz
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.5") (eat "0.9") (ghostel "0.44.0"))
+;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.5") (ghostel "0.44.0"))
 ;; Keywords: tools, processes
 ;; URL: https://github.com/afermg/emacs-claude-dashboard
 
@@ -10,10 +10,9 @@
 
 ;; A single buffer that lists coding-agent CLI instances launched from
 ;; Emacs (Pi, Claude Code, opencode, codex), each running in its own
-;; terminal buffer rooted at a project directory.  `eat' and `ghostel'
-;; are both supported as terminal backends.  Press `n' to launch a new
-;; instance, RET to jump in, `k' to exit it gracefully, `g' to refresh,
-;; `?' for the transient menu.
+;; Ghostel terminal buffer rooted at a project directory.  Press `n' to
+;; launch a new instance, RET to jump in, `k' to exit it gracefully,
+;; `g' to refresh, `?' for the transient menu.
 ;;
 ;; The package was renamed from `claude-dashboard' to `llm-dashboard'.
 ;; Transitional `defvaralias' / `defalias' shims at the bottom of this
@@ -27,8 +26,7 @@
 (require 'transient)
 (require 'project)
 (require 'recentf)
-(require 'eat)
-(require 'ghostel nil t)
+(require 'ghostel)
 
 (defgroup llm-dashboard nil
   "Dashboard for managing coding-agent instances."
@@ -325,35 +323,26 @@ pin it regardless of the active backend."
   (or llm-dashboard-claude-dir
       (llm-dashboard--backend-prop :state-dir)))
 
-(defcustom llm-dashboard-terminal-backend 'eat
+(defcustom llm-dashboard-terminal-backend 'ghostel
   "Terminal emulator used for newly-launched dashboard sessions.
-Supported values are `eat' and `ghostel'.  Existing sessions keep
-using whichever terminal backend their buffer is already running."
-  :type '(choice (const :tag "Eat" eat)
-                 (const :tag "Ghostel" ghostel))
+Only `ghostel' is supported.  Existing sessions keep using their
+current buffer when it is a Ghostel buffer."
+  :type '(const :tag "Ghostel" ghostel)
   :group 'llm-dashboard)
 
-(defun llm-dashboard--resolve-terminal-backend (&optional backend)
-  "Return BACKEND when available, otherwise fall back to `eat'."
-  (pcase (or backend llm-dashboard-terminal-backend)
-    ('ghostel
-     (if (or (featurep 'ghostel) (require 'ghostel nil t))
-         'ghostel
-       'eat))
-    (_
-     (require 'eat)
-     'eat)))
+(defun llm-dashboard--resolve-terminal-backend (&optional _backend)
+  "Return the supported terminal backend."
+  (require 'ghostel)
+  'ghostel)
 
 (defun llm-dashboard--buffer-terminal-backend (&optional buffer)
-  "Return BUFFER's terminal backend, falling back to the configured default."
+  "Return BUFFER's terminal backend, falling back to Ghostel."
   (let ((buf (or buffer (current-buffer))))
-    (if (not (buffer-live-p buf))
-        (llm-dashboard--resolve-terminal-backend)
-      (with-current-buffer buf
-        (cond
-         ((derived-mode-p 'ghostel-mode) 'ghostel)
-         ((derived-mode-p 'eat-mode) 'eat)
-         (t (llm-dashboard--resolve-terminal-backend)))))))
+    (if (and (buffer-live-p buf)
+             (with-current-buffer buf
+               (derived-mode-p 'ghostel-mode)))
+        'ghostel
+      (llm-dashboard--resolve-terminal-backend))))
 
 (defun llm-dashboard--instance-terminal-backend (inst)
   "Return INST's terminal backend."
@@ -404,26 +393,18 @@ against rather than what the worktree currently points at.")
     (nreverse result)))
 
 (defun llm-dashboard--instance-process (inst)
-  "Return INST's live terminal process object, or nil."
+  "Return INST's live Ghostel process object, or nil."
   (when (buffer-live-p (llm-dashboard-instance-buffer inst))
     (with-current-buffer (llm-dashboard-instance-buffer inst)
-      (pcase (llm-dashboard--buffer-terminal-backend (current-buffer))
-        ('ghostel (and (boundp 'ghostel--process) ghostel--process))
-        (_ (get-buffer-process (current-buffer)))))))
+      (and (boundp 'ghostel--process) ghostel--process))))
 
 (defun llm-dashboard--terminal-send-string (buffer string)
-  "Send STRING to BUFFER's managed terminal."
+  "Send STRING to BUFFER's managed Ghostel terminal."
   (when (and (buffer-live-p buffer) (stringp string))
-    (pcase (llm-dashboard--buffer-terminal-backend buffer)
-      ('ghostel
-       (with-current-buffer buffer
-         (require 'ghostel)
-         (ghostel-send-string string)
-         t))
-      (_
-       (when-let ((proc (get-buffer-process buffer)))
-         (process-send-string proc string)
-         t)))))
+    (with-current-buffer buffer
+      (require 'ghostel)
+      (ghostel-send-string string)
+      t)))
 
 (defun llm-dashboard--escape-interrupt-fn (inst)
   "Inject an Escape keypress into INST's terminal."
@@ -452,7 +433,7 @@ terminal, for example:
   "Minor mode active in llm-dashboard-managed terminal buffers.
 
 This mode exposes `llm-dashboard-managed-terminal-mode-map' so users can
-add custom bindings without mutating the shared Eat or Ghostel keymaps."
+add custom bindings without mutating Ghostel's own keymap."
   :init-value nil
   :lighter nil)
 
@@ -1358,23 +1339,6 @@ content.  Either field may be nil."
 
 ;;; Activity tracking via terminal hooks
 
-(defvar-local llm-dashboard--last-eat-pmax nil
-  "Buffer-local: last `point-max' we observed in an eat buffer.
-Compared in `llm-dashboard--note-eat-activity' so cosmetic eat
-redraws (cursor blinks, focus changes, status-line repaints) do
-not get counted as new output — they don't grow the buffer.")
-
-(defun llm-dashboard--note-eat-activity ()
-  "Bump last-output only when the managed eat buffer actually grew."
-  (let* ((inst (gethash (current-buffer) llm-dashboard--instances))
-         (pmax (point-max)))
-    (when inst
-      (when (or (null llm-dashboard--last-eat-pmax)
-                (> pmax llm-dashboard--last-eat-pmax))
-        (setf (llm-dashboard-instance-last-output inst) (float-time))
-        (remhash (current-buffer) llm-dashboard--topic-cache))
-      (setq llm-dashboard--last-eat-pmax pmax))))
-
 (defun llm-dashboard--note-ghostel-activity (&rest _)
   "Bump last-output on textual ghostel buffer changes."
   (let ((inst (gethash (current-buffer) llm-dashboard--instances)))
@@ -1385,38 +1349,20 @@ not get counted as new output — they don't grow the buffer.")
 (defun llm-dashboard--configure-managed-terminal (buffer)
   "Apply llm-dashboard local settings to managed terminal BUFFER."
   (with-current-buffer buffer
-    (pcase (llm-dashboard--buffer-terminal-backend buffer)
-      ('ghostel
-       (setq-local ghostel-kill-buffer-on-exit nil)
-       (add-hook 'after-change-functions
-                 #'llm-dashboard--note-ghostel-activity nil t))
-      (_
-       (setq-local eat-kill-buffer-on-exit nil)
-       (add-hook 'eat-update-hook #'llm-dashboard--note-eat-activity nil t)))
+    (setq-local ghostel-kill-buffer-on-exit nil)
+    (add-hook 'after-change-functions
+              #'llm-dashboard--note-ghostel-activity nil t)
     (llm-dashboard--install-terminal-keybindings)
     (add-hook 'kill-buffer-hook #'llm-dashboard--on-buffer-killed nil t)))
 
-(defun llm-dashboard--launch-terminal (buffer name cwd program args
+(defun llm-dashboard--launch-terminal (buffer _name cwd program args
                                               &optional terminal-backend)
-  "Run PROGRAM with ARGS in BUFFER rooted at CWD.
-TERMINAL-BACKEND defaults to `llm-dashboard-terminal-backend'."
-  (let ((backend (llm-dashboard--resolve-terminal-backend terminal-backend)))
-    (with-current-buffer buffer
-      (setq-local default-directory cwd))
-    (pcase backend
-      ('ghostel
-       (require 'ghostel)
-       (ghostel-exec buffer program args))
-      (_
-       (with-current-buffer buffer
-         ;; Eat's shell-prompt annotation reserves a one-column left margin.
-         ;; Backends like Claude Code are TUI apps, not shells — the column
-         ;; shifts the whole frame right and clips the right edge of the
-         ;; boxed prompt, producing an apparent extra wrap line.  Disable it
-         ;; before `eat-mode' runs so the margin isn't installed.
-         (setq-local eat-enable-shell-prompt-annotation nil)
-         (unless (derived-mode-p 'eat-mode) (eat-mode))
-         (eat-exec buffer name program nil args))))))
+  "Run PROGRAM with ARGS in BUFFER rooted at CWD using Ghostel.
+TERMINAL-BACKEND is accepted for compatibility and ignored."
+  (llm-dashboard--resolve-terminal-backend terminal-backend)
+  (with-current-buffer buffer
+    (setq-local default-directory cwd))
+  (ghostel-exec buffer program args))
 
 ;;; Launch
 

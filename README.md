@@ -3,7 +3,7 @@
 A magit-style Emacs buffer for managing TUI agent instances you launch
 from Emacs — Pi by default, with opt-in support for Claude Code,
 [opencode](https://opencode.ai/), and Codex.
-Each instance runs in its own [eat](https://codeberg.org/akib/emacs-eat)
+Each instance runs in its own [Ghostel](https://github.com/dakra/ghostel)
 terminal buffer rooted at a project directory; the dashboard docks at the
 bottom of the frame and shows them as a single line each — project tag,
 state, uptime, deploy branch, session id, latest activity, and the
@@ -17,7 +17,7 @@ wrapping) and dies when Emacs exits.
 
 Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-section.html),
 [transient](https://elpa.gnu.org/packages/transient.html), and
-[eat](https://codeberg.org/akib/emacs-eat). With straight.el:
+[Ghostel](https://github.com/dakra/ghostel). With straight.el:
 
 ```elisp
 (use-package llm-dashboard
@@ -78,7 +78,7 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `m` / `u`         | mark / unmark current row                  |
 | `t` / `U`         | toggle all marks / unmark all              |
 | `D`   | quit (graceful) marked, or current — also kills its buffer |
-| `x`   | kill eat buffer for marked, or current                 |
+| `x`   | kill terminal buffer for marked, or current            |
 | `k` / `K` | quit (also kills buffer) / kill buffer outright    |
 | `N`   | new agent instance (prompts for cwd)                   |
 | `b`   | new git worktree + branch + agent (backend-specific worktree layout) |
@@ -185,7 +185,7 @@ Three states only — earlier `awaiting` / `monitoring` heuristics misfired
 too often and were removed:
 
 - **● `RUN`** — the active backend's progress spinner is visible in the
-  eat buffer tail (`esc to interrupt` for Claude); the agent is
+  terminal buffer tail (`esc to interrupt` for Claude); the agent is
   producing output or running a tool.
 - **◐ `IDL`** — process alive, no spinner.
 - **○ `EXT`** — process gone.
@@ -220,12 +220,12 @@ too often and were removed:
 
 ### Process lifecycle
 
-The backend process runs as a direct Emacs subprocess inside an
-`eat`-allocated PTY.  When Emacs exits, the PTY closes and the agent
+The backend process runs as a direct Emacs subprocess inside a
+Ghostel terminal.  When Emacs exits, the PTY closes and the agent
 exits too — there is no terminal-multiplexer integration.  Earlier
 branches experimented with both GNU `screen` and `dtach`; neither
 survived enough of the visual artifacts and per-keystroke latency
-they introduced into eat to be worth the survival benefit.  If you
+they introduced to be worth the survival benefit.  If you
 need to pick a conversation back up after restart, the per-session
 transcripts live at `<state-dir>/projects/<slug>/<sid>.jsonl` (for
 Claude: `~/.claude/projects/…`) and `claude --resume <sid>` works on
