@@ -4,7 +4,7 @@
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (magit-section "4.0") (transient "0.5") (ghostel "0.44.0"))
 ;; Keywords: tools, processes
-;; URL: https://github.com/afermg/emacs-claude-dashboard
+;; URL: https://github.com/afermg/emacs-llm-dashboard
 
 ;;; Commentary:
 
@@ -366,6 +366,15 @@ current buffer when it is a Ghostel buffer."
 (defvar llm-dashboard--instances (make-hash-table :test 'eq)
   "Map from managed terminal buffer to `llm-dashboard-instance' struct.")
 
+(defvar llm-dashboard--explicit-session-ids (make-hash-table :test 'eq)
+  "Map managed buffers to authoritative session IDs supplied at launch.
+Kept outside `llm-dashboard-instance' so reloading this file does not change
+its struct layout while older live instance values still exist.")
+
+;; Defined with its full documentation in the rendering section.  Declare it
+;; here because activity, enrichment, and restart paths invalidate it earlier.
+(defvar llm-dashboard--topic-cache)
+
 (defvar llm-dashboard--marks (make-hash-table :test 'eq)
   "Set of marked instance buffers (value t).")
 
@@ -566,6 +575,15 @@ absent.  Fires once per buffer."
                (or preassigned
                    (and llm-dashboard-auto-name-after-turns
                         sid
+                        ;; A resumed Pi branch may share its transcript with
+                        ;; another live branch.  Its terminal title is the
+                        ;; authoritative current name; do not overwrite it
+                        ;; merely because a transcript-only lookup is
+                        ;; ambiguous or unavailable.  Preserve the existing
+                        ;; auto-name behavior for every other backend.
+                        (or (not (eq backend 'pi))
+                            (null (llm-dashboard--pi-terminal-session-name
+                                   inst)))
                         (null (llm-dashboard--session-name-from-transcript
                                inst sid))
                         (>= (llm-dashboard--count-user-turns inst)
@@ -1531,38 +1549,71 @@ SID-TAG is typically the first 8 chars of the session id, or `pending'."
           (with-current-buffer buf
             (rename-buffer target t)))))))
 
-(defun llm-dashboard--normalize-cwd (cwd)
-  "Strip a `.git[/…]' tail from CWD so it points at the repo working tree."
-  (if (and (stringp cwd)
-           (string-match "\\(.*?\\)/\\.git\\(?:/[^\0]*\\)?/?\\'" cwd))
-      (file-name-as-directory (match-string 1 cwd))
-    cwd))
+(defun llm-dashboard--normalize-cwd (cwd &optional resolve-symlinks)
+  "Return a directory form of CWD rooted at the working tree.
+A `.git[/…]' tail is stripped first.  When RESOLVE-SYMLINKS is non-nil,
+local symlinks are resolved so Pi's canonical transcript cwd (for example
+`/work/…') matches an instance launched through an alias (for example
+`~/projects/…').  Remote paths are always normalized textually without calling
+`file-truename', which could force a TRAMP connection."
+  (when (stringp cwd)
+    (let* ((without-git
+            (if (string-match
+                 "\\(.*?\\)/\\.git\\(?:/[^\0]*\\)?/?\\'" cwd)
+                (match-string 1 cwd)
+              cwd))
+           (expanded (file-name-as-directory
+                      (expand-file-name without-git))))
+      (if (or (not resolve-symlinks) (file-remote-p expanded))
+          expanded
+        (file-name-as-directory
+         (or (ignore-errors (file-truename expanded)) expanded))))))
 
-(defun llm-dashboard--register (buffer cwd &optional backend)
+(defun llm-dashboard--register (buffer cwd &optional backend session-id)
   "Insert BUFFER as an instance rooted at CWD into the registry.
-BACKEND defaults to the currently-active `llm-dashboard-backend'."
-  (let* ((cwd (llm-dashboard--normalize-cwd cwd))
+BACKEND defaults to the currently-active `llm-dashboard-backend'.  SESSION-ID,
+when non-nil, is an authoritative ID known by a resume command and is installed
+before enrichment or any dashboard refresh can infer a different session."
+  (let* ((backend (or backend llm-dashboard-backend))
+         (cwd (llm-dashboard--normalize-cwd cwd (eq backend 'pi)))
          (inst (make-llm-dashboard-instance
                 :buffer buffer
                 :cwd cwd
                 :started-at (float-time)
                 :last-output (float-time)
-                :backend (or backend llm-dashboard-backend)))
+                :session-id session-id
+                :backend backend))
          (deploy-branch (llm-dashboard--git-branch cwd)))
     (puthash buffer inst llm-dashboard--instances)
+    (if session-id
+        (puthash buffer session-id llm-dashboard--explicit-session-ids)
+      (remhash buffer llm-dashboard--explicit-session-ids))
     (when deploy-branch
       (puthash buffer deploy-branch llm-dashboard--deploy-branches))
     (llm-dashboard--configure-managed-terminal buffer)
+    (when session-id
+      (llm-dashboard--retag-buffer inst))
     (run-at-time 2 nil #'llm-dashboard--enrich-instance inst)
     (llm-dashboard--write-manifest)
     inst))
+
+(defun llm-dashboard--pi-sid-used-by-other-instance-p (buffer sid)
+  "Return non-nil when a live Pi instance other than BUFFER owns SID."
+  (cl-some
+   (lambda (other)
+     (and (not (eq buffer (llm-dashboard-instance-buffer other)))
+          (eq (llm-dashboard--instance-backend other) 'pi)
+          (equal sid (llm-dashboard-instance-session-id other))))
+   (llm-dashboard--instances-list)))
 
 (defun llm-dashboard--on-buffer-killed ()
   (when-let ((inst (gethash (current-buffer) llm-dashboard--instances)))
     (when-let ((sid (llm-dashboard-instance-session-id inst)))
       (remhash sid llm-dashboard--kind-cache)
       (when (and (eq (llm-dashboard--instance-backend inst) 'pi)
-                 (boundp 'llm-dashboard--pi-transcript-path-cache))
+                 (boundp 'llm-dashboard--pi-transcript-path-cache)
+                 (not (llm-dashboard--pi-sid-used-by-other-instance-p
+                       (current-buffer) sid)))
         (when-let* ((metadata (gethash
                                sid llm-dashboard--pi-transcript-path-cache))
                     (path (plist-get metadata :path)))
@@ -1572,6 +1623,7 @@ BACKEND defaults to the currently-active `llm-dashboard-backend'."
   (when (boundp 'llm-dashboard--pi-unresolved-directory-mtimes)
     (remhash (current-buffer)
              llm-dashboard--pi-unresolved-directory-mtimes))
+  (remhash (current-buffer) llm-dashboard--explicit-session-ids)
   (remhash (current-buffer) llm-dashboard--instances)
   (llm-dashboard--write-manifest)
   (llm-dashboard--maybe-refresh))
@@ -1652,13 +1704,19 @@ Asks for confirmation before launching so a stale manifest from
 weeks ago doesn't surprise you."
   (interactive)
   (let* ((entries (llm-dashboard--read-manifest))
-         (live-cwds (mapcar #'llm-dashboard-instance-cwd
-                            (llm-dashboard--instances-list)))
+         (live-cwds
+          (mapcar (lambda (inst)
+                    (let ((backend (llm-dashboard--instance-backend inst)))
+                      (llm-dashboard--normalize-cwd
+                       (llm-dashboard-instance-cwd inst)
+                       (eq backend 'pi))))
+                  (llm-dashboard--instances-list)))
          (candidates
           (cl-loop for e in entries
-                   for cwd = (plist-get e :cwd)
-                   for sid = (plist-get e :sid)
                    for backend = (or (plist-get e :backend) 'claude)
+                   for cwd = (llm-dashboard--normalize-cwd
+                              (plist-get e :cwd) (eq backend 'pi))
+                   for sid = (plist-get e :sid)
                    when (and cwd sid
                              (file-directory-p cwd)
                              (not (member cwd live-cwds)))
@@ -1675,17 +1733,20 @@ weeks ago doesn't surprise you."
           (llm-dashboard--launch
            (plist-get c :cwd)
            (list (llm-dashboard--backend-prop :resume-flag)
-                 (plist-get c :sid)))))
+                 (plist-get c :sid))
+           (plist-get c :sid))))
       (message "llm-dashboard: resumed %d session(s)" (length candidates))))))
 
-(defun llm-dashboard--launch (cwd extra-args)
-  "Launch the active backend in CWD with EXTRA-ARGS, register, pop, and refresh."
+(defun llm-dashboard--launch (cwd extra-args &optional session-id)
+  "Launch the active backend in CWD with EXTRA-ARGS, register, pop, and refresh.
+SESSION-ID is an optional authoritative resume ID passed into registration
+before enrichment or rendering begins."
   (let* ((name (llm-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (program (llm-dashboard--program))
          (args (append llm-dashboard-program-args extra-args)))
     (llm-dashboard--launch-terminal buf name cwd program args)
-    (llm-dashboard--register buf cwd)
+    (llm-dashboard--register buf cwd nil session-id)
     (pop-to-buffer buf llm-dashboard-instance-window-action)
     ;; Let the terminal appear before rebuilding a visible dashboard.  The
     ;; buffer-switch hooks coalesce with this request onto the same idle timer.
@@ -1767,14 +1828,9 @@ With prefix arg or when called from a row, restrict to that row's cwd."
             (llm-dashboard--current-instance)))))
   (let* ((sess (llm-dashboard--read-past-session only-cwd))
          (sid (llm-dashboard-past-session-session-id sess))
-         (cwd (llm-dashboard-past-session-cwd sess))
-         (buf (llm-dashboard--launch
-               cwd (list (llm-dashboard--backend-prop :resume-flag) sid)))
-         (inst (gethash buf llm-dashboard--instances)))
-    (when inst
-      (setf (llm-dashboard-instance-session-id inst) sid)
-      (llm-dashboard--retag-buffer inst)
-      (llm-dashboard--maybe-refresh))))
+         (cwd (llm-dashboard-past-session-cwd sess)))
+    (llm-dashboard--launch
+     cwd (list (llm-dashboard--backend-prop :resume-flag) sid) sid)))
 
 ;;; Per-instance actions
 
@@ -2005,7 +2061,11 @@ from the managed terminal buffer."
         (setf (llm-dashboard-instance-session-id inst2) nil)
         (setf (llm-dashboard-instance-model inst2) nil)
         (setf (llm-dashboard-instance-branch-cache inst2) nil)
-        (setf (llm-dashboard-instance-last-prompt-cache inst2) nil))
+        (setf (llm-dashboard-instance-last-prompt-cache inst2) nil)
+        (remhash buf llm-dashboard--explicit-session-ids)
+        (remhash buf llm-dashboard--topic-cache)
+        (when (boundp 'llm-dashboard--pi-unresolved-directory-mtimes)
+          (remhash buf llm-dashboard--pi-unresolved-directory-mtimes)))
       (run-at-time 2 nil #'llm-dashboard--enrich-instance inst2)))
   (llm-dashboard--maybe-refresh))
 
@@ -2098,17 +2158,44 @@ field, updated in real-time on `/rename'; opencode falls back to
   (llm-dashboard--backend-call
    :session-name-fn (llm-dashboard--instance-backend inst) inst))
 
+(defun llm-dashboard--decorate-topic (backend name)
+  "Prefix NAME with BACKEND's colored one-glyph dashboard badge."
+  (let* ((badge-str (or (llm-dashboard--backend-prop :badge backend) "?"))
+         (badge-color (or (llm-dashboard--backend-prop :badge-color backend)
+                          "gray60"))
+         (badge (propertize badge-str
+                            'face `(:foreground ,badge-color :weight bold))))
+    (concat badge " " name)))
+
 (defun llm-dashboard--instance-topic (inst)
   "Return INST's topic, or `—' when none has been set.
-Reads the live backend name first, then falls back to the most recent
-session-name stored in the transcript, then a worktree-launch
-placeholder, then a prompt-derived slug from the first user turn.
-The backend badge is prefixed to the visible topic text."
+For Pi, a live Ghostel OSC title is authoritative because two processes can
+resume different branches of the same transcript and carry different names.
+That cheap live value bypasses the normal topic TTL on every refresh.  Other
+cases read the live backend name first, then fall back to the transcript,
+worktree placeholder, or a prompt-derived slug.  The backend badge is prefixed
+to the visible topic text."
   (let* ((buf (llm-dashboard-instance-buffer inst))
+         (backend (llm-dashboard--instance-backend inst))
+         (pi-title-state
+          (and (eq backend 'pi)
+               (llm-dashboard--pi-terminal-title-state inst)))
+         (live-pi-name (and pi-title-state (cdr pi-title-state)))
          (cur (gethash buf llm-dashboard--topic-cache))
          (now (float-time)))
-    (if (and cur (< (- now (cdr cur)) llm-dashboard-cache-ttl))
-        (car cur)
+    (cond
+     (live-pi-name
+      ;; Do not consult CUR here: the title can change without transcript
+      ;; identity changing.
+      (let ((val (llm-dashboard--decorate-topic backend live-pi-name)))
+        (puthash buf (cons val now) llm-dashboard--topic-cache)
+        val))
+     ;; A recognized unnamed Pi title is also authoritative state.  Skip a
+     ;; previously cached live name and recompute the fallback immediately.
+     ((and (null pi-title-state)
+           cur (< (- now (cdr cur)) llm-dashboard-cache-ttl))
+      (car cur))
+     (t
       (let* ((live-sid (llm-dashboard--live-session-id inst))
              (cached-sid (llm-dashboard-instance-session-id inst))
              (name (or (llm-dashboard--live-session-name inst)
@@ -2117,27 +2204,17 @@ The backend badge is prefixed to the visible topic text."
                        (llm-dashboard--session-name-from-transcript
                         inst cached-sid)
                        (gethash buf llm-dashboard--worktree-names)
-                       (let ((prompt (llm-dashboard--first-prompt-from-transcript
-                                      inst)))
-                         (and prompt (llm-dashboard--kebab-from-prompt prompt)))
+                       (let ((prompt
+                              (llm-dashboard--first-prompt-from-transcript
+                               inst)))
+                         (and prompt
+                              (llm-dashboard--kebab-from-prompt prompt)))
                        "—"))
-             ;; Prepend a one-glyph colored backend badge so multi-backend
-             ;; dashboards distinguish claude / opencode / codex rows at
-             ;; a glance.  Width is counted toward TOPIC's column budget.
-             (backend (llm-dashboard--instance-backend inst))
-             (badge-str (or (llm-dashboard--backend-prop :badge backend)
-                            "?"))
-             (badge-color (or (llm-dashboard--backend-prop :badge-color
-                                                             backend)
-                              "gray60"))
-             (badge (propertize badge-str
-                                'face `(:foreground ,badge-color
-                                                    :weight bold)))
-             (val (concat badge " " name)))
+             (val (llm-dashboard--decorate-topic backend name)))
         (when (and live-sid (not (equal live-sid cached-sid)))
           (setf (llm-dashboard-instance-session-id inst) live-sid))
         (puthash buf (cons val now) llm-dashboard--topic-cache)
-        val))))
+        val)))))
 
 (defun llm-dashboard--row-format (branch-w topic-w)
   "Return the row format with dynamic BRANCH-W and TOPIC-W widths.
@@ -3104,9 +3181,11 @@ new JSONL records instead of rereading the complete conversation.")
 
 (defun llm-dashboard--pi-session-directory (cwd)
   "Return Pi's per-project session directory for CWD.
-Pi encodes an absolute CWD as `--<path>--', removing one leading
-separator and replacing `/`, `\\`, and `:' with `-'."
-  (let* ((resolved (directory-file-name (expand-file-name cwd)))
+Pi encodes an absolute canonical CWD as `--<path>--', removing one leading
+separator and replacing `/`, `\\`, and `:' with `-'.  Canonicalization keeps a
+symlinked launch path aligned with the cwd Pi records in its session header."
+  (let* ((resolved (directory-file-name
+                    (llm-dashboard--normalize-cwd cwd t)))
          (without-root
           (replace-regexp-in-string "\\`[/\\\\]" "" resolved))
          (safe (replace-regexp-in-string "[/\\\\:]" "-" without-root)))
@@ -3130,6 +3209,20 @@ separator and replacing `/`, `\\`, and `:' with `-'."
              llm-dashboard--pi-transcript-path-cache))
   path)
 
+(defun llm-dashboard--pi-session-created-at (sid &optional header)
+  "Return SID's creation time as epoch seconds, or nil.
+Pi session IDs are UUIDv7, whose first 48 bits are Unix milliseconds.  HEADER's
+`timestamp' is a fallback for older or nonstandard IDs."
+  (or (when (and (stringp sid)
+                 (string-match
+                  "\\`\\([[:xdigit:]]\\{8\\}\\)-\\([[:xdigit:]]\\{4\\}\\)-7"
+                  sid))
+        (/ (string-to-number
+            (concat (match-string 1 sid) (match-string 2 sid)) 16)
+           1000.0))
+      (when-let ((timestamp (and header (alist-get 'timestamp header))))
+        (ignore-errors (float-time (date-to-time timestamp))))))
+
 (defun llm-dashboard--pi-session-candidates (&optional cwd)
   "Return Pi session metadata candidates, newest first.
 When CWD is non-nil, inspect only that project's session directory.
@@ -3137,36 +3230,44 @@ The active-session path always supplies CWD; a global walk is reserved
 for the explicit past-session browser."
   (let (acc)
     (dolist (path (llm-dashboard--pi-session-files 64 cwd))
-      (let* ((header (unless cwd (llm-dashboard--pi-read-header path)))
-             ;; Pi filenames are <timestamp>_<session-id>.jsonl, so an
-             ;; active CWD scan need not open every candidate's header.
-             (sid (or (and (string-match
-                            "_\\([^_]+\\)\\.jsonl\\'" path)
-                           (match-string 1 path))
-                      (alist-get 'id header)))
+      (let* (;; Pi filenames are <timestamp>_<session-id>.jsonl, so the
+             ;; normal UUIDv7 path need not open every candidate's header.
+             (filename-sid
+              (and (string-match "_\\([^_]+\\)\\.jsonl\\'" path)
+                   (match-string 1 path)))
+             ;; Older/nonstandard IDs need the header timestamp fallback even
+             ;; during a CWD-scoped live lookup.
+             (header (when (or (null cwd)
+                               (null (llm-dashboard--pi-session-created-at
+                                      filename-sid)))
+                       (llm-dashboard--pi-read-header path)))
+             (sid (or filename-sid (alist-get 'id header)))
              (session-cwd (or cwd (alist-get 'cwd header)))
+             (created-at (llm-dashboard--pi-session-created-at sid header))
              (attrs (file-attributes path))
              (mtime (and attrs
                          (file-attribute-modification-time attrs))))
-        (when (and sid session-cwd mtime)
+        (when (and sid session-cwd created-at mtime)
           (push (list :sid sid
-                      :cwd (file-name-as-directory session-cwd)
+                      :cwd (llm-dashboard--normalize-cwd session-cwd t)
+                      :created-at created-at
                       :mtime mtime
                       :path path)
                 acc))))
     (sort acc
           (lambda (a b)
-            (time-less-p (plist-get b :mtime)
-                         (plist-get a :mtime))))))
+            (> (plist-get a :created-at)
+               (plist-get b :created-at))))))
 
 (defun llm-dashboard--pi-live-instances-for-cwd (cwd)
-  "Return live Pi instances rooted at CWD, oldest first."
-  (let ((target (directory-file-name cwd)))
+  "Return live Pi instances canonically rooted at CWD, oldest first."
+  (let ((target (directory-file-name (llm-dashboard--normalize-cwd cwd t))))
     (sort (cl-remove-if-not
            (lambda (other)
              (and (eq (llm-dashboard--instance-backend other) 'pi)
                   (equal (directory-file-name
-                          (llm-dashboard-instance-cwd other))
+                          (llm-dashboard--normalize-cwd
+                           (llm-dashboard-instance-cwd other) t))
                          target)))
            (llm-dashboard--instances-list))
           (lambda (a b)
@@ -3176,6 +3277,17 @@ for the explicit past-session browser."
                   (and (= ta tb)
                        (string-lessp (buffer-name (llm-dashboard-instance-buffer a))
                                      (buffer-name (llm-dashboard-instance-buffer b))))))))))
+
+(defun llm-dashboard--pi-instance-process-started-at (inst)
+  "Return INST's OS child start time as epoch seconds, with struct fallback."
+  (let* ((buf (llm-dashboard-instance-buffer inst))
+         (pid (and (buffer-live-p buf)
+                   (buffer-local-value 'ghostel--pid buf)))
+         (start (and (integerp pid)
+                     (alist-get 'start (process-attributes pid)))))
+    (or (and start (float-time start))
+        (llm-dashboard-instance-started-at inst)
+        0)))
 
 
 (defun llm-dashboard--pi-state-dir ()
@@ -3248,10 +3360,16 @@ that explicitly enumerate past sessions should leave CWD nil."
 
 (defun llm-dashboard--pi-session-id-fn (inst)
   "Pi `:session-id-fn' — resolve INST without scanning unrelated projects.
-A uniquely-owned cached transcript is reused while its per-CWD directory
-mtime is unchanged.  Creating a new Pi session changes that mtime and
-causes one small rescan of this instance's project directory."
-  (let* ((target (directory-file-name (llm-dashboard-instance-cwd inst)))
+An explicit resume ID is authoritative even when multiple buffers intentionally
+share it.  A unique cached assignment remains stable across unrelated session
+creation.  An unresolved fresh process is matched to the unclaimed UUIDv7
+session created nearest its OS start time, rather than mutable transcript
+mtimes."
+  (let* ((target (directory-file-name
+                  (llm-dashboard--normalize-cwd
+                   (llm-dashboard-instance-cwd inst) t)))
+         (buf (llm-dashboard-instance-buffer inst))
+         (explicit-sid (gethash buf llm-dashboard--explicit-session-ids))
          (live (llm-dashboard--pi-live-instances-for-cwd target))
          (cached-sid (llm-dashboard-instance-session-id inst))
          (cached-owner-count
@@ -3261,55 +3379,61 @@ causes one small rescan of this instance's project directory."
          (cached-path (and cached-sid
                            (llm-dashboard--pi-transcript-path-fn
                             target cached-sid)))
-         (cached (and cached-sid
-                      (gethash cached-sid
-                               llm-dashboard--pi-transcript-path-cache)))
          (directory-mtime (llm-dashboard--pi-session-directory-mtime target))
-         (buf (llm-dashboard-instance-buffer inst))
          (no-session-yet
           (gethash buf llm-dashboard--pi-unresolved-directory-mtimes
                    :llm-dashboard-not-cached)))
     (cond
-     ((and cached-sid cached-path (= cached-owner-count 1)
-           (equal directory-mtime
-                  (plist-get cached :directory-mtime)))
+     (explicit-sid
+      ;; Seed the path cache when possible, but never replace a resume ID with
+      ;; a temporal guess.  Pi permits two live branches of one session.
+      (llm-dashboard--pi-transcript-path-fn target explicit-sid)
+      explicit-sid)
+     ;; Appending to a transcript changes its file mtime, and unrelated Pi
+     ;; processes change the directory mtime.  Neither invalidates a unique
+     ;; process-to-session assignment already made for this buffer.
+     ((and cached-sid cached-path (= cached-owner-count 1))
       cached-sid)
      ((and (null cached-sid)
            (not (eq no-session-yet :llm-dashboard-not-cached))
            (equal no-session-yet directory-mtime))
       nil)
      (t
-      (let* ((live-index (cl-position inst live :test #'eq))
-             ;; Match all same-CWD instances against one common candidate
-             ;; window, then assign oldest-to-oldest.  Filtering by each
-             ;; individual instance's start time made the second live buffer
-             ;; reuse the first buffer's SID before its own transcript existed.
-             (oldest-start
-              (if live
-                  (apply #'min
-                         (mapcar (lambda (other)
-                                   (or (llm-dashboard-instance-started-at other)
-                                       0))
-                                 live))
-                0))
+      (let* ((started-at (llm-dashboard--pi-instance-process-started-at inst))
+             (claimed
+              (delq nil
+                    (mapcar
+                     (lambda (other)
+                       (unless (eq other inst)
+                         (or (gethash (llm-dashboard-instance-buffer other)
+                                      llm-dashboard--explicit-session-ids)
+                             (llm-dashboard-instance-session-id other))))
+                     live)))
              (candidates
               (seq-filter
                (lambda (cand)
-                 (let ((candidate-cwd (plist-get cand :cwd))
-                       (mtime (plist-get cand :mtime)))
-                   (and candidate-cwd mtime
-                        (equal (directory-file-name candidate-cwd) target)
-                        (>= (float-time mtime) (- oldest-start 5.0)))))
+                 (let* ((candidate-cwd (plist-get cand :cwd))
+                        (sid (plist-get cand :sid))
+                        (created-at (plist-get cand :created-at))
+                        (delta (and created-at (- created-at started-at))))
+                   (and candidate-cwd sid delta
+                        (equal (directory-file-name
+                                (llm-dashboard--normalize-cwd candidate-cwd t))
+                               target)
+                        (not (member sid claimed))
+                        ;; Pi creates the top-level session at startup.  Only
+                        ;; near-simultaneous files are safe to associate; a
+                        ;; missing match is preferable to borrowing a later
+                        ;; subagent or external session permanently.
+                        (>= delta -5.0)
+                        (<= delta 5.0))))
                (llm-dashboard--pi-session-candidates target)))
-             (usable (sort candidates
-                           (lambda (a b)
-                             (time-less-p (plist-get a :mtime)
-                                          (plist-get b :mtime)))))
-             (n (min (length live) (length usable)))
-             (relevant (if (> n 0) (last usable n) usable))
-             ;; No fallback: a fresh Pi buffer has no session file until its
-             ;; first persisted interaction and must not borrow a sibling SID.
-             (chosen (and live-index (nth live-index relevant)))
+             (chosen
+              (car (sort candidates
+                         (lambda (a b)
+                           (< (abs (- (plist-get a :created-at) started-at))
+                              (abs (- (plist-get b :created-at)
+                                      started-at)))))))
              (sid (plist-get chosen :sid))
              (path (plist-get chosen :path)))
         (if (and sid path)
@@ -3446,14 +3570,58 @@ modification causes a safe full rebuild."
         (puthash path state llm-dashboard--pi-transcript-content-cache))
       state)))
 
+(defconst llm-dashboard--pi-title-spinner-frames
+  '(?⠋ ?⠙ ?⠹ ?⠸ ?⠼ ?⠴ ?⠦ ?⠧ ?⠇ ?⠏)
+  "Spinner glyphs emitted by Pi's titlebar-spinner extension.")
+
+(defun llm-dashboard--pi-terminal-title-state (inst)
+  "Return `(t . NAME)' for a recognized live Pi OSC title.
+NAME is nil for the valid unnamed form `π - PROJECT'.  The named form is
+`π - NAME - PROJECT', optionally prefixed by one documented spinner glyph.
+Anchoring the format prevents an unrelated child-program title containing
+`π - ' from becoming authoritative."
+  (when-let* ((buf (llm-dashboard-instance-buffer inst))
+              (_ (buffer-live-p buf))
+              (title (buffer-local-value 'ghostel--title buf))
+              (_ (stringp title))
+              (project (file-name-nondirectory
+                        (directory-file-name
+                         (llm-dashboard--normalize-cwd
+                          (llm-dashboard-instance-cwd inst) t))))
+              (_ (not (string-empty-p project))))
+    (let ((plain (substring-no-properties title)))
+      (when (and (> (length plain) 2)
+                 (memq (aref plain 0)
+                       llm-dashboard--pi-title-spinner-frames)
+                 (eq (aref plain 1) ?\s))
+        (setq plain (substring plain 2)))
+      (when (string-prefix-p "π - " plain)
+        (let* ((payload (substring plain (length "π - ")))
+               (suffix (concat " - " project)))
+          (cond
+           ((equal payload project) (cons t nil))
+           ((string-suffix-p suffix payload)
+            (let ((name (substring payload 0 (- (length suffix)))))
+              (and (not (string-empty-p name)) (cons t name))))))))))
+
+(defun llm-dashboard--pi-terminal-session-name (inst)
+  "Return INST's named live Pi session from its OSC title, or nil."
+  (cdr (llm-dashboard--pi-terminal-title-state inst)))
+
 (defun llm-dashboard--pi-session-name-fn (inst)
-  "Pi `:session-name-fn' — latest cached `session_info.name' for INST."
-  (when-let* ((sid (or (llm-dashboard--live-session-id inst)
-                       (llm-dashboard-instance-session-id inst)))
-              (path (llm-dashboard--pi-transcript-path-fn
-                     (llm-dashboard-instance-cwd inst) sid))
-              (state (llm-dashboard--pi-update-transcript-cache path)))
-    (llm-dashboard--pi-transcript-state-name state)))
+  "Pi `:session-name-fn' — authoritative terminal state, then transcript.
+The terminal title identifies the active branch when several processes share a
+single append-only session transcript.  A recognized unnamed title suppresses
+stale transcript names."
+  (let ((title-state (llm-dashboard--pi-terminal-title-state inst)))
+    (if title-state
+        (cdr title-state)
+      (when-let* ((sid (or (llm-dashboard--live-session-id inst)
+                           (llm-dashboard-instance-session-id inst)))
+                  (path (llm-dashboard--pi-transcript-path-fn
+                         (llm-dashboard-instance-cwd inst) sid))
+                  (state (llm-dashboard--pi-update-transcript-cache path)))
+        (llm-dashboard--pi-transcript-state-name state)))))
 
 (defun llm-dashboard--pi-transcript-walk-fn (path)
   "Return normalized Pi messages, parsing only records appended to PATH."

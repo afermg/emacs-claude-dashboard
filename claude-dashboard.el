@@ -4,7 +4,7 @@
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (llm-dashboard "0.2"))
 ;; Keywords: tools, processes
-;; URL: https://github.com/afermg/emacs-claude-dashboard
+;; URL: https://github.com/afermg/emacs-llm-dashboard
 
 ;;; Commentary:
 

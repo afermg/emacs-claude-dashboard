@@ -21,7 +21,7 @@ Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-secti
 
 ```elisp
 (use-package llm-dashboard
-  :straight (:host github :repo "afermg/emacs-claude-dashboard"
+  :straight (:host github :repo "afermg/emacs-llm-dashboard"
              :files ("llm-dashboard.el"))
   :commands (llm-dashboard llm-dashboard-new
              llm-dashboard-continue llm-dashboard-resume))
@@ -33,14 +33,14 @@ With `package-vc-install` (Emacs 29+, no straight.el needed):
 (unless (package-installed-p 'llm-dashboard)
   (package-vc-install
    '(llm-dashboard
-     :url "https://github.com/afermg/emacs-claude-dashboard")))
+     :url "https://github.com/afermg/emacs-llm-dashboard")))
 (require 'llm-dashboard)
 ```
 
 Or load manually:
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs-claude-dashboard")
+(add-to-list 'load-path "/path/to/emacs-llm-dashboard")
 (require 'llm-dashboard)
 ```
 
@@ -197,10 +197,10 @@ too often and were removed:
   It re-sizes on every refresh as instances appear and disappear.
 - Each row carries the latest activity (first sentence of Claude's most
   recent assistant text, or a `<Tool> <hint>` summary when the latest
-  content item is a tool_use) and the conversation's TOPIC (the live
-  backend name when available, then the transcript's recorded name,
-  then a worktree or prompt-derived slug, with `—` as the last
-  resort).
+  content item is a tool_use) and the conversation's TOPIC. Pi reads the
+  live Ghostel terminal title first, so two live branches sharing one
+  transcript can keep distinct names; other cases fall back through the
+  backend name, transcript, worktree, prompt-derived slug, and finally `—`.
 - `TAB` on a row reveals recent user queries (`❯ …`); each assistant
   response is a level deeper. Magit's `1`/`2`/`3` (or
   `M-1`/`M-2`/`M-3` for the whole buffer) cycle through the depth. The
@@ -212,8 +212,15 @@ too often and were removed:
 - A 5-second timer re-renders the dashboard whenever it's visible.
 - Terminal launches and buffer-selection hooks queue one coalesced redraw
   after the current command, so switching buffers is not blocked by render work.
-- Expensive lookups (branch name, project name, topic) are cached for
-  30 s per instance.
+- Expensive lookups (branch name, project name, non-live topic fallbacks) are
+  cached for 30 s per instance. Pi's cheap live terminal title is checked on
+  every refresh so `/name` and branch switches do not wait for that TTL.
+- Pi canonicalizes local project roots before matching session directories, so
+  symlink aliases resolve to the cwd stored in its transcript header. Fresh
+  sessions are matched by immutable UUIDv7 creation time near the Ghostel child
+  process start, not by transcript mtimes that change on every append. Explicit
+  IDs selected by resume commands are installed before the first refresh and
+  remain authoritative, including when two buffers share one session ID.
 - Active Pi transcripts are parsed incrementally. Once a JSONL file has been
   seen, refreshes read only bytes appended since the previous pass instead of
   reparsing the full conversation.

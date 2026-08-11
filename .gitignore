@@ -1,3 +1,4 @@
 *.elc
 STATUS.md
 .claude/
+.pi-subagents/
