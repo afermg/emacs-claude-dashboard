@@ -1128,7 +1128,7 @@ the same way."
     (llm-dashboard--retag-buffer inst)
     (llm-dashboard--write-manifest)))
 
-;;; Tool-use extraction (drives the ACTIVITY column + last-exchange body)
+;;; Conversation extraction (drives the prompt column + folded exchanges)
 
 (defun llm-dashboard--latest-tool-use (cwd sid)
   "Return the most recent `tool_use' from SID's transcript, or nil.
@@ -1196,54 +1196,22 @@ Result is a plist (:name STR :input ALIST)."
       (and (> (length clean) 0) clean))))
 
 (defun llm-dashboard--activity-cell (inst)
-  "Return a short summary of INST's most recent agent activity.
-For Claude, walks the JSONL bottom-up and returns the first
-sentence of the latest assistant text content, OR a `<Tool>
-<hint>' summary when the very last assistant content item is a
-tool_use rather than prose.  For other backends, returns the
-first sentence of the most recent assistant message from the
-normalized walker.  Falls back to `—' when no assistant turn
-exists yet."
-  (let* ((backend (llm-dashboard--instance-backend inst))
-         (cwd (llm-dashboard-instance-cwd inst))
-         (sid (or (llm-dashboard--live-session-id inst)
-                  (llm-dashboard-instance-session-id inst))))
-    (or (and (eq backend 'claude)
-             (llm-dashboard--map-jsonl-entries
-              (llm-dashboard--transcript-file-for-sid sid cwd)
-              (lambda (entry)
-                (when (equal "assistant" (alist-get 'type entry))
-                  (let ((content (and (alist-get 'message entry)
-                                      (alist-get 'content
-                                                 (alist-get 'message entry)))))
-                    (when (listp content)
-                      (cl-some
-                       (lambda (c)
-                         (let ((ctype (alist-get 'type c)))
-                           (cond
-                            ((equal "text" ctype)
-                             (llm-dashboard--first-sentence
-                              (alist-get 'text c)))
-                            ((equal "tool_use" ctype)
-                             (let* ((name (alist-get 'name c))
-                                    (hint (llm-dashboard--tool-hint
-                                           name (alist-get 'input c))))
-                               (if (and hint (stringp hint)
-                                        (> (length hint) 0))
-                                   (format "%s %s" name hint)
-                                 name))))))
-                       (reverse content))))))
-              t))
-        ;; Generic path for non-Claude backends: first sentence of the
-        ;; latest assistant message from the normalized walker.
-        (when-let* ((msgs (llm-dashboard--inst-walk-messages-reverse inst))
-                    (last-asst (cl-some
-                                (lambda (m)
-                                  (and (eq (alist-get 'role m) 'assistant)
-                                       (alist-get 'text m)))
-                                msgs)))
-          (llm-dashboard--first-sentence last-asst))
-        "—")))
+  "Return INST's most recent human user prompt as one display line.
+Messages are read newest-first through the backend's normalized transcript
+walker.  Synthetic `<…>' user messages and blank text are ignored.  Falls
+back to `—' when the user has not sent a prompt yet."
+  (or
+   (cl-some
+    (lambda (m)
+      (when (eq (alist-get 'role m) 'user)
+        (let* ((text (alist-get 'text m))
+               (trimmed (and (stringp text) (string-trim text))))
+          (when (and trimmed
+                     (not (string-empty-p trimmed))
+                     (not (string-prefix-p "<" trimmed)))
+            (replace-regexp-in-string "[\t\n\r ]+" " " trimmed)))))
+    (llm-dashboard--inst-walk-messages-reverse inst))
+   "—"))
 
 (defun llm-dashboard--all-exchanges (inst)
   "Return every (:user STR :asst STR :id STR) exchange in INST's session.
@@ -2218,13 +2186,13 @@ to the visible topic text."
 
 (defun llm-dashboard--row-format (branch-w topic-w)
   "Return the row format with dynamic BRANCH-W and TOPIC-W widths.
-ACTIVITY is the trailing column and is rendered with `%s' so it
+LAST PROMPT is the trailing column and is rendered with `%s' so it
 doesn't pad with trailing spaces — that padding could push the
 visible row past the window's right edge and wrap to a second
-line on narrower windows.  TOPIC sits before ACTIVITY at a width
+line on narrower windows.  TOPIC sits before LAST PROMPT at a width
 that fits the longest actual session name (capped by
 `llm-dashboard-topic-max-width'), so short topics never get
-clipped while ACTIVITY absorbs whatever space remains."
+clipped while LAST PROMPT absorbs whatever space remains."
   (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-%ds  %%s"
           llm-dashboard-project-max-width branch-w topic-w))
 
@@ -2323,7 +2291,7 @@ segment intact, elides intermediate components with `…/'."
   (propertize
    (format (llm-dashboard--row-format branch-w topic-w)
            " " " " "PROJECT" "ST" "UP" "BRANCH"
-           "SESSION" "TOPIC" "ACTIVITY")
+           "SESSION" "TOPIC" "LAST PROMPT")
    'face 'magit-section-heading))
 
 (defun llm-dashboard--format-instance-line (inst branch-w topic-w activity-w)
@@ -2395,9 +2363,9 @@ segment intact, elides intermediate components with `…/'."
             (truncate-string-to-width branch branch-w nil ?\s "…")
             sid
             (truncate-string-to-width topic topic-w nil ?\s "…")
-            ;; ACTIVITY is the trailing column — already truncated to
-            ;; activity-w above with no padding char, so short activity
-            ;; cells don't pad the row past the window's right edge.
+            ;; LAST PROMPT is the trailing column — already truncated to
+            ;; activity-w above with no padding char, so short prompt cells
+            ;; don't pad the row past the window's right edge.
             activity-cell)))
 
 (defun llm-dashboard--insert-query-section (xch)
@@ -2443,9 +2411,10 @@ to reveal responses."
 
 (defun llm-dashboard--insert-instance-overview (inst)
   "Insert the bounded per-instance overview body when a row unfolds.
-Each recent user query becomes a foldable subsection whose body is the
-formatted assistant response.  `llm-dashboard-overview-max-exchanges'
-keeps routine redraw time independent of a session's total age."
+Recent user queries are rendered newest-first as foldable subsections whose
+bodies are the formatted assistant responses.
+`llm-dashboard-overview-max-exchanges' keeps routine redraw time independent
+of a session's total age."
   (let* ((limit (and (integerp llm-dashboard-overview-max-exchanges)
                      (> llm-dashboard-overview-max-exchanges 0)
                      llm-dashboard-overview-max-exchanges))
@@ -2458,12 +2427,14 @@ keeps routine redraw time independent of a session's total age."
          (exchanges (if omitted (last candidates limit) candidates)))
     (if exchanges
         (progn
+          ;; The extractors return chronological exchanges.  Render a copy in
+          ;; reverse so the prompt the user just sent is nearest the row.
+          (dolist (xch (reverse exchanges))
+            (llm-dashboard--insert-query-section xch))
           (when omitted
             (insert "    "
                     (propertize "(earlier exchanges omitted)" 'face 'shadow)
-                    "\n"))
-          (dolist (xch exchanges)
-            (llm-dashboard--insert-query-section xch)))
+                    "\n")))
       (insert "    "
               (propertize "(no exchange yet)" 'face 'shadow)
               "\n"))))
@@ -2515,7 +2486,7 @@ keeps routine redraw time independent of a session's total age."
                             1 3 1 5 1 branch-w 1 8 1 topic-w 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
-             ;; ACTIVITY absorbs whatever horizontal space is left, with
+             ;; LAST PROMPT absorbs whatever horizontal space is left, with
              ;; a floor of 16 so it stays usable on narrow windows.
              (activity-w (max 16 (- frame-w prefix-w))))
         (insert (llm-dashboard--header-line branch-w topic-w) "\n")
@@ -3113,7 +3084,7 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
               ;; Accept `text' parts always, and `reasoning' parts for
               ;; assistant turns — opencode emits the chain-of-thought
               ;; as `reasoning' and only sometimes a final `text', so
-              ;; activity columns are near-empty if reasoning is dropped.
+              ;; folded response bodies are near-empty if reasoning is dropped.
               (when (and role
                          (or (equal ptype "text")
                              (and (eq role 'assistant)
@@ -3150,7 +3121,7 @@ PATH is the `opencode-db:<sid>' synthetic URI minted by
 ;; Important: if several Pi instances are launched in the same project,
 ;; each live buffer needs to be matched to a distinct session file.
 ;; Matching purely by cwd picks the newest transcript over and over,
-;; which makes TOPIC and ACTIVITY repeat across rows.  The helpers
+;; which makes TOPIC and LAST PROMPT repeat across rows.  The helpers
 ;; below assign the newest matching session files in launch order.
 
 (defvar llm-dashboard--pi-transcript-path-cache

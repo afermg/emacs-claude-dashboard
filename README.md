@@ -6,7 +6,7 @@ from Emacs — Pi by default, with opt-in support for Claude Code,
 Each instance runs in its own [Ghostel](https://github.com/dakra/ghostel)
 terminal buffer rooted at a project directory; the dashboard docks at the
 bottom of the frame and shows them as a single line each — project tag,
-state, uptime, deploy branch, session id, latest activity, and the
+state, uptime, deploy branch, session id, latest user prompt, and the
 conversation's name.
 
 The dashboard tracks only instances **launched through it**.  Each
@@ -66,7 +66,7 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `n` / `p` / `SPC` | next / previous instance row              |
 | `RET` / `o` | pop to instance buffer                          |
 | `O`   | display instance buffer in other window                |
-| `TAB` | fold/unfold a row's body (last user query + response)  |
+| `TAB` | fold/unfold a row's recent queries and responses      |
 | `1` / `2` / `3` | depth-N expand at point (per-row queries / responses) |
 | `M-1` / `M-2` / `M-3` | same applied to the whole buffer         |
 | `d`   | dired in instance cwd                                  |
@@ -118,10 +118,10 @@ convention). Three are wired up out of the box:
 
 | Backend    | Program    | State dir                  | Transcripts | Status                                       |
 | ---------- | ---------- | -------------------------- | ----------- | -------------------------------------------- |
-| `pi`       | `pi`       | `~/.pi/agent`              | Session JSONL | Full support; default — session discovery, topic, activity, and `/name` via split-write. |
+| `pi`       | `pi`       | `~/.pi/agent`              | Session JSONL | Full support; default — session discovery, topic, latest prompt, and `/name` via split-write. |
 | `claude`   | `claude`   | `~/.claude`                | JSONL         | Full support; includes kind classifier. |
-| `opencode` | `opencode` | `~/.local/share/opencode`  | SQLite        | Full support — sessions, topic, activity, exchange body via the built-in SQLite reader. No `/rename` (opencode lacks the slash command). Requires Emacs built with `--with-sqlite3` (Emacs 30 default). |
-| `codex`    | `codex`    | `~/.codex`                 | Rollout JSONL | Full support — session discovery, topic, activity, and `/rename` via split-write. Topic falls back to the worktree slug since codex has no live name file. |
+| `opencode` | `opencode` | `~/.local/share/opencode`  | SQLite        | Full support — sessions, topic, latest prompt, and exchange body via the built-in SQLite reader. No `/rename` (opencode lacks the slash command). Requires Emacs built with `--with-sqlite3` (Emacs 30 default). |
+| `codex`    | `codex`    | `~/.codex`                 | Rollout JSONL | Full support — session discovery, topic, latest prompt, and `/rename` via split-write. Topic falls back to the worktree slug since codex has no live name file. |
 
 Switch with a single defcustom:
 
@@ -139,7 +139,7 @@ Switch with a single defcustom:
 sessions. Each instance captures its backend symbol at launch time
 into a `:backend` struct slot and persists it in the manifest, so a
 single dashboard can mix pi / claude / opencode / codex rows side by side —
-every row dispatches its own session-id, topic, activity, and rename
+every row dispatches its own session-id, topic, latest prompt, and rename
 through the adapter it was launched against.
 
 Each row's TOPIC column gets a one-glyph colored badge — `P` for
@@ -168,7 +168,7 @@ opt out) drive the per-row column extractors:
 | `:session-id-fn`      | `(inst) → sid \| nil`    | Discover the live session-id for INST.             |
 | `:session-name-fn`    | `(inst) → name \| nil`   | Live user-set name (post-`/rename`).               |
 | `:transcript-path-fn` | `(cwd sid) → path \| nil`| Locate the transcript for a given session.         |
-| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives ACTIVITY, exchanges, first-prompt, turn-counts. |
+| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives LAST PROMPT, exchanges, first-prompt, turn-counts. |
 | `:list-sessions-fn`   | `() → list-of-past`      | Resumable session enumeration for the picker.      |
 | `:rename-fn`          | `(proc slug) → bool`     | Inject a rename command; `nil` means unsupported.  |
 | `:interrupt-fn`       | `(proc) → bool`          | Inject the backend's in-band abort key; `nil` means unsupported. |
@@ -195,14 +195,13 @@ too often and were removed:
 - The dashboard docks via `display-buffer-in-side-window` at
   `llm-dashboard-side` (default `bottom`), with `window-height = fit-window-to-buffer`.
   It re-sizes on every refresh as instances appear and disappear.
-- Each row carries the latest activity (first sentence of Claude's most
-  recent assistant text, or a `<Tool> <hint>` summary when the latest
-  content item is a tool_use) and the conversation's TOPIC. Pi reads the
-  live Ghostel terminal title first, so two live branches sharing one
-  transcript can keep distinct names; other cases fall back through the
-  backend name, transcript, worktree, prompt-derived slug, and finally `—`.
-- `TAB` on a row reveals recent user queries (`❯ …`); each assistant
-  response is a level deeper. Magit's `1`/`2`/`3` (or
+- Each row carries the most recent user prompt in the LAST PROMPT column
+  and the conversation's TOPIC. Pi reads the live Ghostel terminal title
+  first, so two live branches sharing one transcript can keep distinct
+  names; other cases fall back through the backend name, transcript,
+  worktree, prompt-derived slug, and finally `—`.
+- `TAB` on a row reveals recent user queries (`❯ …`) newest-first; each
+  assistant response is a level deeper. Magit's `1`/`2`/`3` (or
   `M-1`/`M-2`/`M-3` for the whole buffer) cycle through the depth. The
   dashboard renders only the most recent 20 exchanges by default so
   refresh cost stays bounded; the backend transcript remains complete.

@@ -376,5 +376,39 @@
             (should-not renamed)))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
+(ert-deftest llm-dashboard-test-activity-shows-latest-user-prompt ()
+  "The trailing dashboard cell shows the newest real user prompt."
+  (let ((inst (llm-dashboard-test--instance nil "/tmp/project/" "sid")))
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_)
+                 '(((role . assistant) (text . "Latest response"))
+                   ((role . user) (text . "  <synthetic context>  "))
+                   ((role . user) (text . "  Latest\n  user prompt  "))
+                   ((role . assistant) (text . "Older response"))
+                   ((role . user) (text . "Older prompt"))))))
+      (should (equal "Latest user prompt"
+                     (llm-dashboard--activity-cell inst))))
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_) '(((role . assistant) (text . "No prompt"))))))
+      (should (equal "—" (llm-dashboard--activity-cell inst))))))
+
+(ert-deftest llm-dashboard-test-overview-renders-newest-first ()
+  "Folded row contents put the newest exchange nearest the instance row."
+  (let ((llm-dashboard-overview-max-exchanges 2))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'llm-dashboard--recent-exchanges)
+                 (lambda (_inst _limit)
+                   '((:user "oldest" :id "1")
+                     (:user "newer" :id "2")
+                     (:user "newest" :id "3"))))
+                ((symbol-function 'llm-dashboard--insert-query-section)
+                 (lambda (xch)
+                   (insert (plist-get xch :user) "\n"))))
+        (llm-dashboard--insert-instance-overview 'instance)
+        (should (equal (concat "newest\n"
+                               "newer\n"
+                               "    (earlier exchanges omitted)\n")
+                       (buffer-string)))))))
+
 (provide 'llm-dashboard-test)
 ;;; llm-dashboard-test.el ends here
